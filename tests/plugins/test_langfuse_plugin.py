@@ -596,6 +596,85 @@ class TestToolCallOutputBackfill:
         }]
 
 
+class TestUserIdPropagation:
+    """HERMES_USER_ID → propagate_attributes(user_id=…) on the root trace (SW-213).
+
+    Multi-tenant hosts (one gateway per end user) set HERMES_USER_ID in the
+    gateway env; every trace — interactive turns and cron runs alike — must
+    then carry that id as the Langfuse user_id. Unset/empty env must pass
+    user_id=None (byte-identical behavior to before the feature)."""
+
+    def _run_start_root_trace(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        captured: dict = {}
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_propagate(**kwargs):
+            captured.update(kwargs)
+            yield
+
+        monkeypatch.setattr(mod, "propagate_attributes", fake_propagate)
+
+        class _FakeObservationCtx:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, *exc):
+                return False
+
+        class _FakeClient:
+            def create_trace_id(self, seed):
+                return "trace-id"
+
+            def start_as_current_observation(self, **kwargs):
+                return _FakeObservationCtx()
+
+        state = mod._start_root_trace(
+            "task:t",
+            task_id="t",
+            session_id="sess-1",
+            platform="api_server",
+            provider="openrouter",
+            model="m",
+            api_mode="chat",
+            messages=[{"role": "user", "content": "hi"}],
+            client=_FakeClient(),
+        )
+        assert state is not None
+        return captured
+
+    def test_env_set_stamps_user_id(self, monkeypatch):
+        monkeypatch.setenv("HERMES_USER_ID", "user-uuid-123")
+        captured = self._run_start_root_trace(monkeypatch)
+        assert captured["user_id"] == "user-uuid-123"
+        # The pre-existing attributes are untouched.
+        assert captured["session_id"] == "sess-1"
+        assert captured["trace_name"] == "Hermes turn"
+
+    def test_env_unset_passes_none(self, monkeypatch):
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        captured = self._run_start_root_trace(monkeypatch)
+        assert captured["user_id"] is None
+
+    def test_env_empty_passes_none(self, monkeypatch):
+        monkeypatch.setenv("HERMES_USER_ID", "")
+        captured = self._run_start_root_trace(monkeypatch)
+        assert captured["user_id"] is None
+
+    def test_real_langfuse_sdk_accepts_user_id_kwarg(self):
+        """Guard against a langfuse pin whose propagate_attributes lacks
+        user_id: the plugin's try/except would silently drop session
+        attribution too. Skips when the SDK isn't installed."""
+        langfuse = pytest.importorskip("langfuse")
+        import inspect
+
+        sig = inspect.signature(langfuse.propagate_attributes)
+        assert "user_id" in sig.parameters
+
+
 class TestToolObservationKeying:
     """Tests for pre/post tool_call observation matching when tool_call_id is absent."""
 
