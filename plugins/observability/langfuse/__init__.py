@@ -23,6 +23,9 @@ Optional env vars:
       sanitized - content with secret-pattern redaction + truncation
       full      - raw content (truncated only); explicit opt-in
   HERMES_LANGFUSE_DEBUG       - set to "true" for verbose logging
+  HERMES_USER_ID              - end-user id stamped on every trace as the
+                                Langfuse user_id (per-user attribution in
+                                multi-tenant deployments); unset = omitted
 """
 from __future__ import annotations
 
@@ -906,6 +909,9 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         try:
             with propagate_attributes(
                 session_id=session_id or task_key,
+                # Multi-tenant hosts set HERMES_USER_ID to attribute every trace
+                # (interactive turns and cron runs alike) to the end user.
+                user_id=_env("HERMES_USER_ID") or None,
                 trace_name="Hermes turn",
                 tags=["hermes", "langfuse"],
             ):
