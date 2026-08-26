@@ -23,6 +23,9 @@ Optional env vars:
       sanitized - content with secret-pattern redaction + truncation
       full      - raw content (truncated only); explicit opt-in
   HERMES_LANGFUSE_DEBUG       - set to "true" for verbose logging
+  HERMES_USER_ID              - end-user id stamped on every trace as the
+                                Langfuse user_id (per-user attribution in
+                                multi-tenant deployments); unset = omitted
 """
 from __future__ import annotations
 
@@ -49,6 +52,7 @@ class TraceState:
     trace_id: str
     root_ctx: Any
     root_span: Any
+    prop_ctx: Any = None
     generations: Dict[str, Any] = field(default_factory=dict)
     tools: Dict[str, Any] = field(default_factory=dict)
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
@@ -902,52 +906,53 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     if session_id:
         trace_ctx["session_id"] = session_id
 
+    # Enter propagate_attributes WITHOUT a with-block and keep it open until
+    # _finish_trace: a with-block exits (detaches) the propagate context while
+    # the root observation context is still attached ON TOP of it — an
+    # out-of-order OTel detach that fails silently and leaks this turn's
+    # session attributes into every later turn on the thread (the
+    # sessionId-scramble). Both contexts must unwind LIFO: root_ctx first,
+    # then prop_ctx (see _finish_trace / _finalize_all_traces / eviction).
+    prop_ctx = None
     if propagate_attributes is not None:
         try:
-            with propagate_attributes(
+            prop_ctx = propagate_attributes(
                 session_id=session_id or task_key,
+                # Multi-tenant hosts set HERMES_USER_ID to attribute every trace
+                # (interactive turns and cron runs alike) to the end user.
+                user_id=_env("HERMES_USER_ID") or None,
                 trace_name="Hermes turn",
                 tags=["hermes", "langfuse"],
-            ):
-                root_ctx = client.start_as_current_observation(
-                    trace_context=trace_ctx,
-                    name="Hermes turn",
-                    as_type="chain",
-                    input=trace_input,
-                    metadata=metadata,
-                    end_on_exit=False,
-                )
-                root_span = root_ctx.__enter__()
-        except Exception:
-            root_ctx = client.start_as_current_observation(
-                trace_context=trace_ctx,
-                name="Hermes turn",
-                as_type="chain",
-                input=trace_input,
-                metadata=metadata,
-                end_on_exit=False,
             )
-            root_span = root_ctx.__enter__()
-    else:
-        root_ctx = client.start_as_current_observation(
-            trace_context=trace_ctx,
-            name="Hermes turn",
-            as_type="chain",
-            input=trace_input,
-            metadata=metadata,
-            end_on_exit=False,
-        )
-        root_span = root_ctx.__enter__()
+            prop_ctx.__enter__()
+        except Exception:  # pragma: no cover - fail-open
+            prop_ctx = None
+    root_ctx = client.start_as_current_observation(
+        trace_context=trace_ctx,
+        name="Hermes turn",
+        as_type="chain",
+        input=trace_input,
+        metadata=metadata,
+        end_on_exit=False,
+    )
+    root_span = root_ctx.__enter__()
 
     # SDK v3 uses update_trace() (not set_trace_io). Failures must never block
     # the rest of the turn — the observation still carries input from start.
     try:
         root_span.update_trace(input=trace_input)
+    except AttributeError:
+        # Langfuse SDK v4 renamed the trace-IO setter; keep both spellings so
+        # the trace-level Input/Output columns populate on either SDK line.
+        try:
+            root_span.set_trace_io(input=trace_input)
+        except Exception as exc:  # pragma: no cover - fail-open
+            _debug(f"set_trace_io(input) failed: {exc}")
     except Exception as exc:
         _debug(f"update_trace(input) failed: {exc}")
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span, prop_ctx=prop_ctx)
 
 
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
@@ -1018,6 +1023,11 @@ def _evict_stale_locked() -> None:
                     state.root_ctx.__exit__(None, None, None)
                 except Exception:  # pragma: no cover - fail-open
                     pass
+            if state.prop_ctx is not None:
+                try:
+                    state.prop_ctx.__exit__(None, None, None)
+                except Exception:  # pragma: no cover - fail-open
+                    pass
         except Exception as exc:  # pragma: no cover - fail-open
             _debug(f"evict stale trace failed: {exc}")
 
@@ -1062,6 +1072,11 @@ def _finalize_all_traces() -> None:
                     state.root_ctx.__exit__(None, None, None)
                 except Exception:  # pragma: no cover - fail-open
                     pass
+            if state.prop_ctx is not None:
+                try:
+                    state.prop_ctx.__exit__(None, None, None)
+                except Exception:  # pragma: no cover - fail-open
+                    pass
         except Exception as exc:  # pragma: no cover - fail-open
             _debug(f"atexit finalize failed for {_key}: {exc}")
     if states:
@@ -1100,6 +1115,11 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             # list view looks half-empty.
             try:
                 state.root_span.update_trace(output=final_output)
+            except AttributeError:
+                try:
+                    state.root_span.set_trace_io(output=final_output)
+                except Exception as exc:  # pragma: no cover - fail-open
+                    _debug(f"set_trace_io(output) failed: {exc}")
             except Exception as exc:
                 _debug(f"update_trace(output) failed: {exc}")
             try:
@@ -1119,6 +1139,11 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
         if state.root_ctx is not None:
             try:
                 state.root_ctx.__exit__(None, None, None)
+            except Exception:  # pragma: no cover - fail-open
+                pass
+        if state.prop_ctx is not None:
+            try:
+                state.prop_ctx.__exit__(None, None, None)
             except Exception:  # pragma: no cover - fail-open
                 pass
     except Exception as exc:  # pragma: no cover - fail-open
