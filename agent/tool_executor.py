@@ -559,6 +559,20 @@ def _run_tool_activity_heartbeat(
         pass
 
 
+# Inline agent-loop tools whose ``_execute`` closure calls the tool function
+# directly (no ``handle_function_call``), so nothing emits ``post_tool_call``
+# for them: observer plugins (Langfuse) open a tool span on ``pre_tool_call``
+# and never see it end — the span is flush-closed at trace finish with no
+# output (observed live 2026-08-27: 2151/2162 prod ``Tool: session_search``
+# spans had ``output=null``). The middleware emits for exactly this set after a
+# dispatched execute; ``delegate_task`` and generic tools emit on their own path.
+_INLINE_TOOLS_WITHOUT_POST_HOOK = frozenset({
+    "todo", "session_search", "memory", "clarify", "read_terminal",
+    "read_preview", "drive_preview", "annotate_preview", "read_window_below",
+    "tour", "setup_mcp",
+})
+
+
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -708,11 +722,24 @@ def _run_agent_tool_execution_middleware(
             name=f"tool-activity-hb-{function_name[:24]}",
         )
         _hb_thread.start()
+        _exec_started = time.monotonic()
         try:
-            return execute(final_args)
+            result = execute(final_args)
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
+        if function_name in _INLINE_TOOLS_WITHOUT_POST_HOOK:
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=final_args,
+                result=result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                duration_ms=int((time.monotonic() - _exec_started) * 1000),
+                middleware_trace=list(state["middleware_trace"]),
+            )
+        return result
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(
