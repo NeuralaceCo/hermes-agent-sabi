@@ -6660,6 +6660,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 name = name.strip()[:160]
                 if name:
                     result["name"] = name
+            schedule = value.get("schedule")
+            if isinstance(schedule, str):
+                schedule = schedule.strip()[:120]
+                if schedule:
+                    result["schedule"] = schedule
             return result
 
         def _safe_tool_args(tool_name: Any, value: Any) -> Optional[Dict[str, Any]]:

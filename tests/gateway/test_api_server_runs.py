@@ -144,6 +144,7 @@ class TestStartRun:
             args={
                 "action": "pause",
                 "name": "Daily brief",
+                "schedule": "0 8 * * *",
                 "job_id": "private-job-id",
                 "prompt": "private scheduled prompt",
             },
@@ -154,6 +155,7 @@ class TestStartRun:
             args={
                 "action": "pause",
                 "name": "Daily brief",
+                "schedule": "0 8 * * *",
                 "job_id": "private-job-id",
                 "prompt": "private scheduled prompt",
             },
@@ -161,8 +163,12 @@ class TestStartRun:
 
         started = await asyncio.wait_for(queue.get(), timeout=1)
         completed = await asyncio.wait_for(queue.get(), timeout=1)
-        assert started["args"] == {"action": "pause", "name": "Daily brief"}
-        assert completed["args"] == {"action": "pause", "name": "Daily brief"}
+        assert started["args"] == {
+            "action": "pause", "name": "Daily brief", "schedule": "0 8 * * *"
+        }
+        assert completed["args"] == {
+            "action": "pause", "name": "Daily brief", "schedule": "0 8 * * *"
+        }
         assert started["preview"] == "pause"
         assert "private-job-id" not in str(started)
         assert "private scheduled prompt" not in str(started)
