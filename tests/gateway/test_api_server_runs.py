@@ -149,7 +149,57 @@ class TestStartRun:
                 assert callable(mock_agent.clarify_callback)
                 assert mock_agent.clarify_callback(
                     "Question?", None, questions=[{"question": "Question?"}]
-                ) == {"answers": {}, "timed_out": True}
+                ) == {"answers": {}}
+                mock_agent.interrupt.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_async_clarify_stops_turn_before_following_action(self, adapter):
+        """A displayed API question must park the turn until the next message."""
+        app = _create_runs_app(adapter)
+        action_executed = False
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent._interrupt_requested = False
+
+                def _interrupt():
+                    mock_agent._interrupt_requested = True
+
+                def _run_conversation(**_kwargs):
+                    nonlocal action_executed
+                    answer = mock_agent.clarify_callback(
+                        "When should I run it?", ["09:00", "17:00"]
+                    )
+                    if not mock_agent._interrupt_requested:
+                        action_executed = True
+                    return {
+                        "final_response": "",
+                        "interrupted": mock_agent._interrupt_requested,
+                        "clarify_result": answer,
+                    }
+
+                mock_agent.interrupt.side_effect = _interrupt
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "Schedule it"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(100):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert status["status"] == "completed"
+                assert action_executed is False
+                mock_agent.interrupt.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):

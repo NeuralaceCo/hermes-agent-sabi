@@ -6900,16 +6900,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                     )
                     # API clients render clarify as an asynchronous question
-                    # card and answer in their next conversational turn. Do
-                    # not block this worker waiting for terminal input, and do
-                    # not report the tool as unavailable after publishing it.
+                    # card and answer in their next conversational turn. Stop
+                    # this turn after publishing the card: returning the usual
+                    # timeout sentinel tells the model to guess and continue,
+                    # which can execute later tool calls before the user has
+                    # answered.
                     def _defer_clarify(
                         question, choices, multi_select=False, questions=None
                     ):
+                        agent.interrupt()
                         if questions:
-                            return {"answers": {}, "timed_out": True}
-                        from tools.clarify_tool import TIMEOUT_RESPONSE
-                        return TIMEOUT_RESPONSE
+                            return {"answers": {}}
+                        return "Waiting for the user's response in the client."
 
                     agent.clarify_callback = _defer_clarify
                     self._active_run_agents[run_id] = agent
