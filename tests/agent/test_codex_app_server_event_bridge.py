@@ -216,10 +216,35 @@ class TestToolProgressDispatch:
         assert completed.args[0] == "tool.completed"
         assert completed.args[1] == "exec_command"
         assert completed.args[2] is None  # preview unused on completion
-        assert completed.args[3] is None  # args unused on completion
+        assert completed.args[3] == {"command": "echo hi", "cwd": "/tmp"}
         assert completed.kwargs["duration"] == pytest.approx(0.042)
         assert completed.kwargs["is_error"] is False
         assert completed.kwargs["result"] == "hi\n"
+
+    def test_completion_without_start_preserves_dynamic_tool_args(self):
+        """Fast tools can complete before a start notification is observed."""
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "dynamicToolCall",
+            "id": "cron-1",
+            "tool": "cronjob",
+            "arguments": {
+                "action": "update",
+                "job_id": "private-job-id",
+                "prompt": "private scheduled prompt",
+            },
+            "status": "completed",
+        }))
+
+        completed = agent.tool_progress_callback.call_args
+        assert completed.args[0] == "tool.completed"
+        assert completed.args[1] == "cronjob"
+        assert completed.args[3] == {
+            "action": "update",
+            "job_id": "private-job-id",
+            "prompt": "private scheduled prompt",
+        }
 
 
 
