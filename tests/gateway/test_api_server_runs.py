@@ -143,6 +143,7 @@ class TestStartRun:
             ),
             args={
                 "action": "pause",
+                "name": "Daily brief",
                 "job_id": "private-job-id",
                 "prompt": "private scheduled prompt",
             },
@@ -152,6 +153,7 @@ class TestStartRun:
             tool_name="cronjob",
             args={
                 "action": "pause",
+                "name": "Daily brief",
                 "job_id": "private-job-id",
                 "prompt": "private scheduled prompt",
             },
@@ -159,8 +161,8 @@ class TestStartRun:
 
         started = await asyncio.wait_for(queue.get(), timeout=1)
         completed = await asyncio.wait_for(queue.get(), timeout=1)
-        assert started["args"] == {"action": "pause"}
-        assert completed["args"] == {"action": "pause"}
+        assert started["args"] == {"action": "pause", "name": "Daily brief"}
+        assert completed["args"] == {"action": "pause", "name": "Daily brief"}
         assert started["preview"] == "pause"
         assert "private-job-id" not in str(started)
         assert "private scheduled prompt" not in str(started)

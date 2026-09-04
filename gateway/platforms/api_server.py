@@ -6650,7 +6650,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 "create", "update", "pause", "resume", "remove", "delete", "run", "list"
             }:
                 return None
-            return {"action": action}
+            result = {"action": action}
+            # The optional display name is already user-visible in the
+            # scheduled-task sidebar and lets Cap render the same reminder
+            # card used for one-off reminders. Prompts, schedules, and job ids
+            # remain private.
+            name = value.get("name")
+            if isinstance(name, str):
+                name = name.strip()[:160]
+                if name:
+                    result["name"] = name
+            return result
 
         def _safe_tool_args(tool_name: Any, value: Any) -> Optional[Dict[str, Any]]:
             normalized = str(tool_name or "").strip().lower()
