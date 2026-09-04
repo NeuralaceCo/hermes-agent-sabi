@@ -6587,6 +6587,57 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        def _safe_clarify_args(value: Any) -> Optional[Dict[str, Any]]:
+            """Allow-list only the bounded user-visible clarify prompt fields."""
+            if not isinstance(value, dict):
+                return None
+
+            raw_questions = value.get("questions")
+            if not isinstance(raw_questions, list):
+                raw_questions = [{
+                    "id": "q0",
+                    "question": value.get("question"),
+                    "choices": value.get("choices"),
+                    "multi_select": value.get("multi_select"),
+                }]
+
+            questions = []
+            for index, raw in enumerate(raw_questions[:5]):
+                if not isinstance(raw, dict):
+                    continue
+                question = raw.get("question")
+                if not isinstance(question, str) or not question.strip():
+                    continue
+                raw_id = raw.get("id")
+                qid = raw_id.strip() if isinstance(raw_id, str) else ""
+                if not qid or len(qid) > 64 or not all(
+                    char.isalnum() or char in "_-" for char in qid
+                ):
+                    qid = f"q{index}"
+                choices = []
+                if isinstance(raw.get("choices"), list):
+                    for choice in raw["choices"][:4]:
+                        if isinstance(choice, str):
+                            label = choice.strip()[:160]
+                        elif isinstance(choice, dict):
+                            label = next((
+                                choice[key].strip()[:160]
+                                for key in ("label", "description", "text", "title")
+                                if isinstance(choice.get(key), str) and choice[key].strip()
+                            ), "")
+                        else:
+                            label = ""
+                        if label:
+                            choices.append(label)
+                questions.append({
+                    "id": qid,
+                    "question": question.strip()[:500],
+                    "choices": choices,
+                    "multi_select": raw.get("multi_select") is True,
+                })
+
+            return {"questions": questions} if questions else None
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -6604,13 +6655,18 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
-                _push({
+                event = {
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
-                })
+                }
+                if str(tool_name or "").lower() == "clarify":
+                    safe_args = _safe_clarify_args(args)
+                    if safe_args is not None:
+                        event["args"] = safe_args
+                _push(event)
             elif event_type == "tool.completed":
                 _push({
                     "event": "tool.completed",
@@ -6843,7 +6899,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         model_options=agent_overrides.get("model_options"),
                         route=route,
                     )
-                self._active_run_agents[run_id] = agent
+                    # API clients render clarify as an asynchronous question
+                    # card and answer in their next conversational turn. Do
+                    # not block this worker waiting for terminal input, and do
+                    # not report the tool as unavailable after publishing it.
+                    def _defer_clarify(
+                        question, choices, multi_select=False, questions=None
+                    ):
+                        if questions:
+                            return {"answers": {}, "timed_out": True}
+                        from tools.clarify_tool import TIMEOUT_RESPONSE
+                        return TIMEOUT_RESPONSE
+
+                    agent.clarify_callback = _defer_clarify
+                    self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})

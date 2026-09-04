@@ -21,7 +21,7 @@ class TestHermesApiServerToolset:
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze", "image_generate",
             "execute_code", "delegate_task",
-            "todo", "memory", "session_search", "cronjob",
+            "todo", "memory", "session_search", "cronjob", "clarify",
         ]
         for tool in expected:
             assert tool in tools, f"Missing expected tool: {tool}"
@@ -79,4 +79,3 @@ class TestApiServerAdapterToolset:
             assert isinstance(toolsets, list)
             assert len(toolsets) > 0
             assert call_kwargs.kwargs.get("platform") == "api_server"
-

@@ -146,6 +146,10 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+                assert callable(mock_agent.clarify_callback)
+                assert mock_agent.clarify_callback(
+                    "Question?", None, questions=[{"question": "Question?"}]
+                ) == {"answers": {}, "timed_out": True}
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):

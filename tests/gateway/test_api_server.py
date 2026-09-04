@@ -625,6 +625,52 @@ class TestDisconnectedAgentReap:
 class TestRunEventCallback:
 
     @pytest.mark.asyncio
+    async def test_clarify_started_exposes_only_bounded_prompt_fields(self, adapter):
+        run_id = "run_clarify"
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+
+        callback = adapter._make_run_event_callback(run_id, loop)
+        callback(
+            "tool.started",
+            tool_name="clarify",
+            args={
+                "questions": [{
+                    "id": "topics",
+                    "question": "Which topics matter?",
+                    "choices": ["Technology", {"label": "Markets", "secret": "drop"}],
+                    "multi_select": True,
+                }],
+                "secret": "never-public",
+            },
+        )
+
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event["args"] == {
+            "questions": [{
+                "id": "topics",
+                "question": "Which topics matter?",
+                "choices": ["Technology", "Markets"],
+                "multi_select": True,
+            }],
+        }
+        assert "secret" not in repr(event)
+
+    @pytest.mark.asyncio
+    async def test_non_clarify_started_never_exposes_tool_arguments(self, adapter):
+        run_id = "run_terminal"
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        callback = adapter._make_run_event_callback(run_id, loop)
+
+        callback("tool.started", tool_name="terminal", args={"command": "echo secret"})
+
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert "args" not in event
+
+    @pytest.mark.asyncio
     async def test_subagent_events_redact_secrets_and_carry_child_session(self, adapter):
         """Free-text fields (goal/summary/output_tail/preview) must pass the
         forced secret redaction before hitting the public /v1/runs stream,
