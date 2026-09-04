@@ -1854,8 +1854,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # resume can reconstruct the tool result that was already visible.
         if not blocked and agent.tool_progress_callback:
             try:
+                display_args = (
+                    _redact_tool_args_for_display(name, args) or args
+                )
                 agent.tool_progress_callback(
-                    "tool.completed", progress_function_name, None, None,
+                    "tool.completed", progress_function_name, None, display_args,
                     duration=tool_duration, is_error=is_error,
                     result=display_function_result,
                 )
@@ -2742,8 +2745,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # row, never a competing in-memory authority.
         if not _execution_blocked and agent.tool_progress_callback:
             try:
+                display_args = (
+                    _redact_tool_args_for_display(function_name, function_args)
+                    or function_args
+                )
                 agent.tool_progress_callback(
-                    "tool.completed", function_name, None, None,
+                    "tool.completed", function_name, None, display_args,
                     duration=tool_duration, is_error=_is_error_result,
                     result=display_function_result,
                 )

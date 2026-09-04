@@ -584,8 +584,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         result, is_error = _codex_item_completion_payload(item)
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
+            completion_args = (
+                prior[1] if prior is not None else _codex_item_to_args(item)
+            )
             try:
-                cb("tool.completed", name, None, None,
+                cb("tool.completed", name, None, completion_args,
                    duration=duration, is_error=is_error, result=result)
             except Exception:
                 logger.debug(

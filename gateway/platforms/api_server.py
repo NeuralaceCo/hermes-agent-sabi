@@ -6638,6 +6638,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
             return {"questions": questions} if questions else None
 
+        def _safe_cronjob_args(value: Any) -> Optional[Dict[str, Any]]:
+            """Expose only the operation needed to label scheduled-task activity."""
+            if not isinstance(value, dict):
+                return None
+            action = value.get("action")
+            if not isinstance(action, str):
+                return None
+            action = action.strip().lower()
+            if action not in {
+                "create", "update", "pause", "resume", "remove", "delete", "run", "list"
+            }:
+                return None
+            return {"action": action}
+
+        def _safe_tool_args(tool_name: Any, value: Any) -> Optional[Dict[str, Any]]:
+            normalized = str(tool_name or "").strip().lower()
+            if normalized in {"clarify", "ask_user_question", "askuserquestion"}:
+                return _safe_clarify_args(value)
+            if normalized == "cronjob":
+                return _safe_cronjob_args(value)
+            return None
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -6655,27 +6677,36 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
+                safe_args = _safe_tool_args(tool_name, args)
+                safe_preview = preview
+                if str(tool_name or "").strip().lower() == "cronjob":
+                    # Generic tool previews may serialize every argument.  A
+                    # schedule prompt and job id are private conversation data,
+                    # so the public stream only gets the allow-listed verb.
+                    safe_preview = safe_args.get("action") if safe_args else None
                 event = {
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
-                    "preview": preview,
+                    "preview": safe_preview,
                 }
-                if str(tool_name or "").lower() == "clarify":
-                    safe_args = _safe_clarify_args(args)
-                    if safe_args is not None:
-                        event["args"] = safe_args
+                if safe_args is not None:
+                    event["args"] = safe_args
                 _push(event)
             elif event_type == "tool.completed":
-                _push({
+                event = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
-                })
+                }
+                safe_args = _safe_tool_args(tool_name, args)
+                if safe_args is not None:
+                    event["args"] = safe_args
+                _push(event)
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",

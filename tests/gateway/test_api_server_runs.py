@@ -123,6 +123,51 @@ def auth_adapter():
 
 class TestStartRun:
     @pytest.mark.asyncio
+    async def test_run_events_expose_only_cronjob_action(self, adapter):
+        """Schedule activity needs a verb without leaking its prompt or identifiers."""
+        run_id = "run_schedule_activity"
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._run_statuses[run_id] = {"status": "running"}
+        callback = adapter._make_run_event_callback(
+            run_id,
+            asyncio.get_running_loop(),
+        )
+
+        callback(
+            "tool.started",
+            tool_name="cronjob",
+            preview=(
+                '{"action":"pause","job_id":"private-job-id",'
+                '"prompt":"private scheduled prompt"}'
+            ),
+            args={
+                "action": "pause",
+                "job_id": "private-job-id",
+                "prompt": "private scheduled prompt",
+            },
+        )
+        callback(
+            "tool.completed",
+            tool_name="cronjob",
+            args={
+                "action": "pause",
+                "job_id": "private-job-id",
+                "prompt": "private scheduled prompt",
+            },
+        )
+
+        started = await asyncio.wait_for(queue.get(), timeout=1)
+        completed = await asyncio.wait_for(queue.get(), timeout=1)
+        assert started["args"] == {"action": "pause"}
+        assert completed["args"] == {"action": "pause"}
+        assert started["preview"] == "pause"
+        assert "private-job-id" not in str(started)
+        assert "private scheduled prompt" not in str(started)
+        assert "private-job-id" not in str(completed)
+        assert "private scheduled prompt" not in str(completed)
+
+    @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
