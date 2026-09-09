@@ -1249,6 +1249,180 @@ class TestCaptureModes:
 
 
 # ---------------------------------------------------------------------------
+# HERMES_USER_ID / prop_ctx propagation (SW-213)
+# ---------------------------------------------------------------------------
+
+class TestUserIdPropagation:
+    """HERMES_USER_ID → propagate_attributes(user_id=…) on the root trace.
+
+    Multi-tenant hosts (one gateway per end user) set HERMES_USER_ID in the
+    gateway env; every trace — interactive turns and cron runs alike — must
+    then carry that id as the Langfuse user_id. Unset/empty env must pass
+    user_id=None (byte-identical behavior to before the feature)."""
+
+    def _run_start_root_trace(self, monkeypatch, platform="api_server"):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        captured: dict = {}
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_propagate(**kwargs):
+            captured.update(kwargs)
+            yield
+
+        monkeypatch.setattr(mod, "propagate_attributes", fake_propagate)
+
+        class _FakeObservationCtx:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, *exc):
+                return False
+
+        class _FakeClient:
+            def create_trace_id(self, seed=None):
+                return "trace-id"
+
+            def start_as_current_observation(self, **kwargs):
+                return _FakeObservationCtx()
+
+        state = mod._start_root_trace(
+            "task:t",
+            task_id="t",
+            session_id="sess-1",
+            platform=platform,
+            provider="openrouter",
+            model="m",
+            api_mode="chat",
+            messages=[{"role": "user", "content": "hi"}],
+            client=_FakeClient(),
+        )
+        assert state is not None
+        return captured
+
+    def test_env_set_stamps_user_id(self, monkeypatch):
+        monkeypatch.setenv("HERMES_USER_ID", "user-uuid-123")
+        captured = self._run_start_root_trace(monkeypatch)
+        assert captured["user_id"] == "user-uuid-123"
+        # The pre-existing attributes are untouched.
+        assert captured["session_id"] == "sess-1"
+        assert captured["trace_name"] == "Hermes turn"
+
+    def test_env_unset_passes_none(self, monkeypatch):
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        captured = self._run_start_root_trace(monkeypatch)
+        assert captured["user_id"] is None
+
+    def test_env_empty_passes_none(self, monkeypatch):
+        monkeypatch.setenv("HERMES_USER_ID", "")
+        captured = self._run_start_root_trace(monkeypatch)
+        assert captured["user_id"] is None
+
+    def test_tags_include_platform_when_given(self, monkeypatch):
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        captured = self._run_start_root_trace(monkeypatch, platform="api_server")
+        assert captured["tags"] == ["hermes", "langfuse", "platform:api_server"]
+
+    def test_tags_omit_platform_when_blank(self, monkeypatch):
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        captured = self._run_start_root_trace(monkeypatch, platform="")
+        assert captured["tags"] == ["hermes", "langfuse"]
+
+    def test_real_langfuse_sdk_accepts_user_id_kwarg(self):
+        """Guard against a langfuse pin whose propagate_attributes lacks
+        user_id: the plugin's try/except would silently drop session
+        attribution too. Skips when the SDK isn't installed."""
+        langfuse = pytest.importorskip("langfuse")
+        import inspect
+
+        sig = inspect.signature(langfuse.propagate_attributes)
+        assert "user_id" in sig.parameters
+
+    def test_end_root_exits_prop_ctx_after_root_ctx(self):
+        """A with-block would exit prop_ctx while root_ctx is still attached on
+        top of it; _end_root must unwind LIFO instead (root_ctx, then
+        prop_ctx)."""
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        order: list = []
+
+        class _RootCtx:
+            def __exit__(self, *exc):
+                order.append("root_ctx")
+                return False
+
+        class _PropCtx:
+            def __exit__(self, *exc):
+                order.append("prop_ctx")
+                return False
+
+        class _Span:
+            def end(self, **kw):
+                order.append("root_span.end")
+
+        state = mod.TraceState(
+            trace_id="t", root_ctx=_RootCtx(), root_span=_Span(), prop_ctx=_PropCtx(),
+        )
+        mod._end_root(state, "test end")
+        assert order == ["root_span.end", "root_ctx", "prop_ctx"]
+
+    def test_start_and_finish_fall_back_to_set_trace_io(self, monkeypatch):
+        """When the root span class lacks update_trace but has set_trace_io
+        (langfuse v4), both _start_root_trace and _finish_trace must use it."""
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        monkeypatch.setattr(mod, "propagate_attributes", None)
+
+        io_calls: list = []
+
+        class _Span:
+            # Deliberately NO update_trace — mirrors langfuse SDK v4.
+            def set_trace_io(self, **kw):
+                io_calls.append(("set_trace_io", kw))
+
+            def update(self, **kw):
+                io_calls.append(("update", kw))
+
+            def end(self, **kw):
+                io_calls.append(("end", kw))
+
+            def start_observation(self, **kw):
+                return _Span()
+
+        class _RootCtx:
+            def __enter__(self):
+                return _Span()
+
+            def __exit__(self, *exc):
+                return False
+
+        class _Client:
+            def create_trace_id(self, seed=None):
+                return "trace-x"
+
+            def start_as_current_observation(self, **kw):
+                return _RootCtx()
+
+            def flush(self):
+                pass
+
+        state = mod._start_root_trace(
+            "task:t2", task_id="t2", session_id="s2", platform="api_server",
+            provider="p", model="m", api_mode="chat",
+            messages=[{"role": "user", "content": "hi"}], client=_Client(),
+        )
+        assert any(op == "set_trace_io" and "input" in kw for op, kw in io_calls)
+
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: _Client())
+        mod._TRACE_STATE["task:t2"] = state
+        mod._finish_trace("task:t2", output="done")
+        assert any(op == "set_trace_io" and "output" in kw for op, kw in io_calls)
+
+
+# ---------------------------------------------------------------------------
 # api_request_error hook
 # ---------------------------------------------------------------------------
 

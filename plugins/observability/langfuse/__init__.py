@@ -4,7 +4,9 @@ Activated via ``plugins.enabled``; hooks are inert without the ``langfuse`` SDK
 and credentials. Env: HERMES_LANGFUSE_PUBLIC_KEY / SECRET_KEY (required),
 BASE_URL, ENV, RELEASE, SAMPLE_RATE, MAX_CHARS (12000), DEBUG, and CAPTURE =
 metadata (sizes/ids/usage only) | sanitized (default: secret redaction +
-truncation) | full (truncated raw content). See README.md.
+truncation) | full (truncated raw content). HERMES_USER_ID stamps every trace
+with a Langfuse user_id (per-user attribution in multi-tenant deployments;
+unset = omitted). See README.md.
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ class TraceState:
     trace_id: str
     root_ctx: Any
     root_span: Any
+    prop_ctx: Any = None
     generations: Dict[str, Any] = field(default_factory=dict)
     tools: Dict[str, Any] = field(default_factory=dict)
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
@@ -507,6 +510,22 @@ def _usage_and_cost(response: Any, *, provider: str, model: str, base_url: str, 
         return {}, {}
 
 
+def _set_trace_io(root_span: Any, **io: Any) -> None:
+    """Trace-level I/O setter: SDK v3 exposes update_trace(...); v4 (4.14+,
+    the image's ``langfuse>=4.1,<5`` pin) renamed it to set_trace_io(...). Try both;
+    stay fail-open — telemetry must never block the turn."""
+    label = next(iter(io), "io")
+    try:
+        root_span.update_trace(**io)
+    except AttributeError:
+        try:
+            root_span.set_trace_io(**io)
+        except Exception as exc:  # pragma: no cover - fail-open
+            _debug(f"set_trace_io({label}) failed: {exc}")
+    except Exception as exc:
+        _debug(f"update_trace({label}) failed: {exc}")
+
+
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
                       turn_id: str = "", api_request_id: str = "") -> TraceState:
@@ -527,22 +546,32 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
                                                   input=trace_input, metadata=metadata, end_on_exit=False)
         return ctx, ctx.__enter__()
 
-    root_ctx = root_span = None
+    # Enter propagate_attributes WITHOUT a with-block and keep it open until
+    # _end_root: a with-block exits (detaches) it while the root observation is
+    # still attached ON TOP of it — an out-of-order OTel detach that fails
+    # silently and leaks this turn's session attributes into later turns on
+    # the thread. Both contexts unwind LIFO in _end_root: root_ctx first, then
+    # prop_ctx.
+    prop_ctx = None
     if propagate_attributes is not None:
         try:
-            with propagate_attributes(session_id=session_id or task_key, trace_name="Hermes turn",
-                                      tags=["hermes", "langfuse"]):
-                root_ctx, root_span = open_root()
-        except Exception:
-            root_ctx = None
-    if root_ctx is None:
-        root_ctx, root_span = open_root()
+            prop_ctx = propagate_attributes(
+                session_id=session_id or task_key,
+                # Multi-tenant hosts set HERMES_USER_ID to attribute every trace
+                # (interactive turns and cron runs alike) to the end user.
+                user_id=_env("HERMES_USER_ID") or None,
+                trace_name="Hermes turn",
+                tags=["hermes", "langfuse", *([f"platform:{platform}"] if platform else [])],
+            )
+            prop_ctx.__enter__()
+        except Exception:  # pragma: no cover - fail-open
+            prop_ctx = None
+    root_ctx, root_span = open_root()
 
-    with _failsafe("update_trace(input)"):  # SDK v3 uses update_trace()
-        root_span.update_trace(input=trace_input)
+    _set_trace_io(root_span, input=trace_input)
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span, prop_ctx=prop_ctx)
 
 
 def _start_child_observation(state: TraceState, *, name: str, as_type: str, input_value: Any,
@@ -573,7 +602,7 @@ def _end_children(state: TraceState, *, include_subagents: bool = False) -> None
 
 
 def _end_root(state: TraceState, label: str) -> None:
-    """End the root span then unwind its context; never raises."""
+    """End the root span then unwind its context(s); never raises."""
     with _failsafe(label):
         state.root_span.end()
         # Unwind the root context manager now, while opentelemetry.trace.Span is
@@ -581,6 +610,14 @@ def _end_root(state: TraceState, label: str) -> None:
         # TypeError inside use_span's isinstance check.
         if state.root_ctx is not None:
             state.root_ctx.__exit__(None, None, None)
+        # prop_ctx was entered BEFORE root_ctx in _start_root_trace, so it must
+        # exit AFTER it (LIFO) — own try so a failure here can't skip past work
+        # already done above.
+        if state.prop_ctx is not None:
+            try:
+                state.prop_ctx.__exit__(None, None, None)
+            except Exception:  # pragma: no cover - fail-open
+                pass
 
 
 def _finalize_all_traces() -> None:
@@ -619,11 +656,12 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             final_output = dict(output) if isinstance(output, dict) else {"content": output}
             final_output["tool_calls"] = list(state.turn_tool_calls)
         if final_output is not None:
-            # update_trace sets TRACE-level I/O (SDK v3); root I/O via update().
-            # Neither may prevent end(), else children export without a root.
-            for method, label in (("update_trace", "update_trace(output)"), ("update", "root update(output)")):
-                with _failsafe(label):
-                    getattr(state.root_span, method)(output=final_output)
+            # update_trace/set_trace_io sets TRACE-level I/O; root I/O via
+            # update(). Neither may prevent end(), else children export
+            # without a root.
+            _set_trace_io(state.root_span, output=final_output)
+            with _failsafe("root update(output)"):
+                state.root_span.update(output=final_output)
         _end_root(state, "root end()")
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
