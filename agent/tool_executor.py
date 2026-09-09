@@ -1031,9 +1031,13 @@ def _commit_tool_result(
     if not blocked:
         # ``tool.completed`` projects AFTER the canonical append + flush so resume can
         # reconstruct the result even if the UI bridge dies mid-projection.
+        try:
+            display_args = _redact_tool_args_for_display(function_name, ref.args) or ref.args
+        except Exception:
+            display_args = ref.args
         _safe_callback(
             agent.tool_progress_callback, "Tool progress",
-            "tool.completed", function_name, None, None, duration=tool_duration, is_error=is_error, result=function_result,
+            "tool.completed", function_name, None, display_args, duration=tool_duration, is_error=is_error, result=function_result,
         )
     return persisted_result, function_result, tool_message.get("_tool_output_risk")
 

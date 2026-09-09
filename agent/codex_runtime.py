@@ -313,10 +313,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         has_codex_ms = isinstance(codex_ms, (int, float)) and codex_ms >= 0
         duration: Any = codex_ms / 1000.0 if has_codex_ms else (time.monotonic() - prior[2] if prior else None)
         result, is_error = _codex_item_completion_payload(item)
-        agent_cb("tool_progress_callback", "tool_progress_callback raised on tool.completed for %s", name,
-                 args=("tool.completed", name, None, None),
-                 kwargs={"duration": duration, "is_error": is_error, "result": result})
+        # Completion carries the (possibly cached, since fast items can complete
+        # before a start notification is observed) args so observer plugins
+        # (Langfuse) can close the tool span they opened on tool.started.
         args = prior[1] if prior is not None else _codex_item_to_args(item)
+        agent_cb("tool_progress_callback", "tool_progress_callback raised on tool.completed for %s", name,
+                 args=("tool.completed", name, None, args),
+                 kwargs={"duration": duration, "is_error": is_error, "result": result})
         agent_cb("tool_complete_callback", "tool_complete_callback raised for %s", name,
                  args=(_stable_call_id(item, name), name, args, result))
 
