@@ -43,6 +43,99 @@ _FIXED_EVENT_FIELDS = {
     "tool.completed": lambda tool, preview, kw: {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
+# clarify's tool name varies by call site; cronjob was renamed cronjob_manage upstream
+# but /v1/runs clients (and older agent builds) may still surface either spelling.
+_CLARIFY_TOOL_NAMES = frozenset({"clarify", "ask_user_question", "askuserquestion"})
+_CRONJOB_TOOL_NAMES = frozenset({"cronjob", "cronjob_manage"})
+_CRONJOB_ACTIONS = frozenset({"create", "update", "pause", "resume", "remove", "delete", "run", "list"})
+
+
+def _safe_clarify_args(value: Any) -> Optional[Dict[str, Any]]:
+    """Allow-list only the bounded user-visible clarify prompt fields."""
+    if not isinstance(value, dict):
+        return None
+
+    raw_questions = value.get("questions")
+    if not isinstance(raw_questions, list):
+        raw_questions = [{
+            "id": "q0",
+            "question": value.get("question"),
+            "choices": value.get("choices"),
+            "multi_select": value.get("multi_select"),
+        }]
+
+    questions = []
+    for index, raw in enumerate(raw_questions[:5]):
+        if not isinstance(raw, dict):
+            continue
+        question = raw.get("question")
+        if not isinstance(question, str) or not question.strip():
+            continue
+        raw_id = raw.get("id")
+        qid = raw_id.strip() if isinstance(raw_id, str) else ""
+        if not qid or len(qid) > 64 or not all(
+            char.isalnum() or char in "_-" for char in qid
+        ):
+            qid = f"q{index}"
+        choices = []
+        if isinstance(raw.get("choices"), list):
+            for choice in raw["choices"][:4]:
+                if isinstance(choice, str):
+                    label = choice.strip()[:160]
+                elif isinstance(choice, dict):
+                    label = next((
+                        choice[key].strip()[:160]
+                        for key in ("label", "description", "text", "title")
+                        if isinstance(choice.get(key), str) and choice[key].strip()
+                    ), "")
+                else:
+                    label = ""
+                if label:
+                    choices.append(label)
+        questions.append({
+            "id": qid,
+            "question": question.strip()[:500],
+            "choices": choices,
+            "multi_select": raw.get("multi_select") is True,
+        })
+
+    return {"questions": questions} if questions else None
+
+
+def _safe_cronjob_args(value: Any) -> Optional[Dict[str, Any]]:
+    """Expose only the operation needed to label scheduled-task activity."""
+    if not isinstance(value, dict):
+        return None
+    action = value.get("action")
+    if not isinstance(action, str):
+        return None
+    action = action.strip().lower()
+    if action not in _CRONJOB_ACTIONS:
+        return None
+    result = {"action": action}
+    # The optional display name is already user-visible in the scheduled-task
+    # sidebar and lets clients render the same reminder card used for one-off
+    # reminders. Prompts, schedules, and job ids remain private.
+    name = value.get("name")
+    if isinstance(name, str):
+        name = name.strip()[:160]
+        if name:
+            result["name"] = name
+    schedule = value.get("schedule")
+    if isinstance(schedule, str):
+        schedule = schedule.strip()[:120]
+        if schedule:
+            result["schedule"] = schedule
+    return result
+
+
+def _safe_tool_args(tool_name: Any, value: Any) -> Optional[Dict[str, Any]]:
+    normalized = str(tool_name or "").strip().lower()
+    if normalized in _CLARIFY_TOOL_NAMES:
+        return _safe_clarify_args(value)
+    if normalized in _CRONJOB_TOOL_NAMES:
+        return _safe_cronjob_args(value)
+    return None
 
 
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
@@ -161,7 +254,17 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
         # lifecycle boundaries must land so clients can observe delegate_task failures.
         fields = _FIXED_EVENT_FIELDS.get(event_type)
         if fields is not None:
-            _push(_run_event(run_id, event_type, **fields(tool_name, preview, kwargs)))
+            event_fields = fields(tool_name, preview, kwargs)
+            if event_type in ("tool.started", "tool.completed"):
+                safe_args = _safe_tool_args(tool_name, args)
+                if event_type == "tool.started" and str(tool_name or "").strip().lower() in _CRONJOB_TOOL_NAMES:
+                    # Generic tool previews may serialize every argument. A
+                    # schedule prompt and job id are private conversation
+                    # data, so the public stream only gets the allow-listed verb.
+                    event_fields["preview"] = safe_args.get("action") if safe_args else None
+                if safe_args is not None:
+                    event_fields["args"] = safe_args
+            _push(_run_event(run_id, event_type, **event_fields))
         elif event_type in {"subagent.start", "subagent.complete"}:
             event = _run_event(run_id, event_type)
             if preview is not None:
@@ -566,6 +669,19 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
+
+        # API clients render clarify as an asynchronous question card and
+        # answer in their next conversational turn. Stop this turn after
+        # publishing the card: returning the usual timeout sentinel tells the
+        # model to guess and continue, which can execute later tool calls
+        # before the user has answered.
+        def _defer_clarify(question, choices, multi_select=False, questions=None):
+            agent.interrupt()
+            if questions:
+                return {"answers": {}}
+            return "Waiting for the user's response in the client."
+
+        agent.clarify_callback = _defer_clarify
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(

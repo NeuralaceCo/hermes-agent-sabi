@@ -21,7 +21,7 @@ class TestHermesApiServerToolset:
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze", "image_generate",
             "execute_code", "delegate_task",
-            "todo_list", "memory", "session_search", "cronjob_manage",
+            "todo_list", "memory", "session_search", "cronjob_manage", "clarify",
         ]
         for tool in expected:
             assert tool in tools, f"Missing expected tool: {tool}"

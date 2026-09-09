@@ -180,6 +180,59 @@ class TestStartRun:
         handler.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_run_events_expose_only_cronjob_action(self, adapter):
+        """Schedule activity needs a verb without leaking its prompt or identifiers."""
+        run_id = "run_schedule_activity"
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._run_statuses[run_id] = {"status": "running"}
+        callback = adapter._make_run_event_callback(
+            run_id,
+            asyncio.get_running_loop(),
+        )
+
+        callback(
+            "tool.started",
+            tool_name="cronjob",
+            preview=(
+                '{"action":"pause","job_id":"private-job-id",'
+                '"prompt":"private scheduled prompt"}'
+            ),
+            args={
+                "action": "pause",
+                "name": "Daily brief",
+                "schedule": "0 8 * * *",
+                "job_id": "private-job-id",
+                "prompt": "private scheduled prompt",
+            },
+        )
+        callback(
+            "tool.completed",
+            tool_name="cronjob_manage",
+            args={
+                "action": "pause",
+                "name": "Daily brief",
+                "schedule": "0 8 * * *",
+                "job_id": "private-job-id",
+                "prompt": "private scheduled prompt",
+            },
+        )
+
+        started = await asyncio.wait_for(queue.get(), timeout=1)
+        completed = await asyncio.wait_for(queue.get(), timeout=1)
+        assert started["args"] == {
+            "action": "pause", "name": "Daily brief", "schedule": "0 8 * * *"
+        }
+        assert completed["args"] == {
+            "action": "pause", "name": "Daily brief", "schedule": "0 8 * * *"
+        }
+        assert started["preview"] == "pause"
+        assert "private-job-id" not in str(started)
+        assert "private scheduled prompt" not in str(started)
+        assert "private-job-id" not in str(completed)
+        assert "private scheduled prompt" not in str(completed)
+
+    @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -203,6 +256,60 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+                assert callable(mock_agent.clarify_callback)
+                assert mock_agent.clarify_callback(
+                    "Question?", None, questions=[{"question": "Question?"}]
+                ) == {"answers": {}}
+                mock_agent.interrupt.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_async_clarify_stops_turn_before_following_action(self, adapter):
+        """A displayed API question must park the turn until the next message."""
+        app = _create_runs_app(adapter)
+        action_executed = False
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent._interrupt_requested = False
+
+                def _interrupt():
+                    mock_agent._interrupt_requested = True
+
+                def _run_conversation(**_kwargs):
+                    nonlocal action_executed
+                    answer = mock_agent.clarify_callback(
+                        "When should I run it?", ["09:00", "17:00"]
+                    )
+                    if not mock_agent._interrupt_requested:
+                        action_executed = True
+                    return {
+                        "final_response": "",
+                        "interrupted": mock_agent._interrupt_requested,
+                        "clarify_result": answer,
+                    }
+
+                mock_agent.interrupt.side_effect = _interrupt
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "Schedule it"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(100):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] in {"completed", "failed", "cancelled"}:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert status["status"] == "completed"
+                assert action_executed is False
+                mock_agent.interrupt.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
