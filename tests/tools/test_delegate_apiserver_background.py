@@ -165,3 +165,84 @@ def test_apiserver_session_without_id_stays_synchronous(monkeypatch):
     assert parsed.get("status") != "dispatched", parsed
     assert "SYNCHRONOUSLY" in parsed.get("note", "")
     assert process_registry.completion_queue.empty()
+
+
+# ---------------------------------------------------------------------------
+# delegation.sync_when_async_unsupported — opt back into the sync fallback
+# ---------------------------------------------------------------------------
+
+
+def _bind_apiserver(sid="raw-sid-7", async_delivery=False):
+    set_session_vars(
+        platform="api_server", chat_id=sid, session_key=sid, session_id=sid,
+        async_delivery=async_delivery,
+    )
+
+
+def _set_delegation_cfg(monkeypatch, cfg):
+    import tools.delegate_tool as dt
+
+    monkeypatch.setattr(dt, "_load_config", lambda: cfg)
+
+
+def test_sync_key_off_keeps_background_wake(monkeypatch):
+    """Key explicitly off → unchanged: background dispatch + self-post wake sid."""
+    from tools.delegate_tool_dispatch import _resolve_async_wake_sid
+
+    monkeypatch.delenv("DELEGATION_SYNC_WHEN_ASYNC_UNSUPPORTED", raising=False)
+    _set_delegation_cfg(monkeypatch, {"sync_when_async_unsupported": False})
+    _bind_apiserver()
+    assert _resolve_async_wake_sid("raw-sid-7") == "raw-sid-7"
+
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-7")
+    parsed = json.loads(dt.delegate_task(
+        goal="bg on api_server", context="ctx", background=True, parent_agent=_fake_parent(),
+    ))
+    assert parsed["status"] == "dispatched", parsed
+    assert parsed["mode"] == "background"
+    evt = _drain_one()
+    assert evt is not None and evt["origin_session_id"] == "raw-sid-7"
+
+
+def test_sync_key_on_apiserver_with_session_id_runs_synchronously(monkeypatch):
+    """Key on + async_delivery=False + bound session id → None (sync fallback): the
+    children's results come back inline in the same tool result, nothing is queued."""
+    from tools.delegate_tool_dispatch import _resolve_async_wake_sid
+
+    _set_delegation_cfg(monkeypatch, {"sync_when_async_unsupported": True})
+    _bind_apiserver()
+    assert _resolve_async_wake_sid("raw-sid-7") is None
+
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-7")
+    parsed = json.loads(dt.delegate_task(
+        tasks=[{"goal": "first sync task"}, {"goal": "second sync task"}, {"goal": "third sync task"}],
+        context="ctx", background=True, parent_agent=_fake_parent(),
+    ))
+    assert parsed.get("status") != "dispatched", parsed
+    assert "SYNCHRONOUSLY" in parsed.get("note", "")
+    assert sorted(r["summary"] for r in parsed["results"]) == ["done: first sync task", "done: second sync task", "done: third sync task"]
+    assert process_registry.completion_queue.empty()
+
+
+def test_sync_key_env_fallback(monkeypatch):
+    """DELEGATION_SYNC_WHEN_ASYNC_UNSUPPORTED applies when the config key is unset."""
+    from tools.delegate_tool_dispatch import _resolve_async_wake_sid
+
+    _set_delegation_cfg(monkeypatch, {})
+    _bind_apiserver()
+    monkeypatch.setenv("DELEGATION_SYNC_WHEN_ASYNC_UNSUPPORTED", "true")
+    assert _resolve_async_wake_sid("raw-sid-7") is None
+    monkeypatch.setenv("DELEGATION_SYNC_WHEN_ASYNC_UNSUPPORTED", "false")
+    assert _resolve_async_wake_sid("raw-sid-7") == "raw-sid-7"
+
+
+def test_sync_key_on_async_supported_unchanged(monkeypatch):
+    """Key on but the session CAN receive detached completions → unchanged
+    ("" = normal async routing, no sync fallback)."""
+    from tools.delegate_tool_dispatch import _resolve_async_wake_sid
+
+    _set_delegation_cfg(monkeypatch, {"sync_when_async_unsupported": True})
+    _bind_apiserver(async_delivery=True)
+    assert _resolve_async_wake_sid("raw-sid-7") == ""
