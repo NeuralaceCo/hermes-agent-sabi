@@ -104,6 +104,19 @@ def _get_independent_completions() -> bool:
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
     return is_truthy_value(_cfg().get("independent_completions", False))
 
+def _get_sync_when_async_unsupported() -> bool:
+    """delegation.sync_when_async_unsupported (bool, default False) > DELEGATION_SYNC_WHEN_ASYNC_UNSUPPORTED env.
+
+    On sessions that cannot receive detached completions (async_delivery=False, e.g. the API server) a bound session
+    id normally still dispatches in the background and wakes the session by self-posting /v1/chat/completions when the
+    children finish. Clients that treat one /v1/runs run as one answer never see that wake turn. true = run the
+    children SYNCHRONOUSLY in the calling turn instead (the existing "no_async" fallback)."""
+    return _knob(
+        "sync_when_async_unsupported", "DELEGATION_SYNC_WHEN_ASYNC_UNSUPPORTED",
+        lambda v: is_truthy_value(v, default=False), False,
+        "delegation.sync_when_async_unsupported=%r is not a valid boolean; using default False",
+    )
+
 def _get_worktree_isolation() -> bool:
     """delegation.worktree_isolation (bool, default False): each child gets its own
     git worktree off the parent's HEAD so parallel children never contend for one

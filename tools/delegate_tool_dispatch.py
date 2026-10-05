@@ -211,7 +211,8 @@ def _resolve_async_wake_sid(origin_wake_sid: str) -> Optional[str]:
     turn/process ends — but if a raw session id is bound (the API server always binds one), gateway.wake can still
     reach it by self-POSTing /v1/chat/completions, so only fall back to sync when there is truly no session id to
     wake. Uses the origin captured BEFORE child construction — HERMES_SESSION_ID here would be the subagent's internal
-    id.
+    id. delegation.sync_when_async_unsupported=true skips the self-post wake and always falls back to sync on such
+    sessions, for clients that consume one run as one answer.
     """
     try:
         # Finite sessions cannot route a detached subagent result back to the agent after their turn/process
@@ -223,6 +224,14 @@ def _resolve_async_wake_sid(origin_wake_sid: str) -> Optional[str]:
             return ""
     except Exception:
         return ""
+    from tools.delegate_tool_config import _get_sync_when_async_unsupported
+    if _get_sync_when_async_unsupported():
+        logger.info(
+            "delegate_task: async delivery unsupported on this session (session id %r) and "
+            "delegation.sync_when_async_unsupported is set — running the batch synchronously in this turn instead of "
+            "dispatching in the background with a self-post wake.", origin_wake_sid or "",
+        )
+        return None
     if origin_wake_sid:
         logger.info(
             "delegate_task: async delivery unsupported on this session, but a session id is bound (%s) — dispatching "
