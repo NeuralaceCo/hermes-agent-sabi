@@ -97,8 +97,19 @@ def _clean_choices(choices: list) -> Optional[List[str]]:
     return cleaned[:MAX_CHOICES] or None
 
 
+# The messaging gateway's clarify wait (gateway/run.py ``_clarify_send_then_wait``) answers a
+# timeout or an undeliverable card with its own bracketed text instead of TIMEOUT_RESPONSE.
+# Read as an answer, it kept a batch asking the next question for another full timeout (SW-1128).
+GATEWAY_GIVE_UP_PREFIXES = ("[user did not respond within", "[clarify prompt could not be delivered")
+
+
 def _is_timeout(raw) -> bool:
-    return raw is None or (isinstance(raw, str) and raw.strip() == TIMEOUT_RESPONSE)
+    if raw is None:
+        return True
+    if not isinstance(raw, str):
+        return False
+    text = raw.strip()
+    return text == TIMEOUT_RESPONSE or text.startswith(GATEWAY_GIVE_UP_PREFIXES)
 
 
 # ============================================================================= Batch (multi-question)

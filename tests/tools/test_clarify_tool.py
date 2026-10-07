@@ -630,6 +630,28 @@ class TestClarifyBatchDispatch:
             "answered", "", "",
         ]
 
+    def test_legacy_loop_aborts_on_the_gateway_timeout_text(self):
+        """SW-1128: the messaging gateway answers a timed-out (or undeliverable) card with
+        its own bracketed text. The loop must stop there, not ask the next question and
+        wait another full timeout."""
+        for give_up in ("[user did not respond within 60m]",
+                        "[clarify prompt could not be delivered]",
+                        "[clarify prompt could not be delivered: destination refused]"):
+            calls = []
+
+            def legacy_cb(question, choices):
+                calls.append(question)
+                return give_up if len(calls) == 2 else "answered"
+
+            result = json.loads(clarify_tool(
+                "",
+                questions=[{"question": "One?"}, {"question": "Two?"}, {"question": "Three?"}],
+                callback=legacy_cb,
+            ))
+            assert calls == ["One?", "Two?"], give_up
+            assert result["timed_out"] is True
+            assert [r["user_response"] for r in result["responses"]] == ["answered", "", ""]
+
     def test_legacy_loop_skip_continues(self):
         """An explicit empty answer is a skip. The loop continues."""
         calls = []
