@@ -211,3 +211,53 @@ class TestProducerHook:
         claimed = dl.sweep_recoverable()
         assert len(claimed) == 1
         assert claimed[0]["needs_marker"] is True
+
+
+class _MarkerRunner:
+    """Stands in for the GatewayRunner: records the ledger states at each marker release."""
+
+    def __init__(self):
+        self.released_with = []
+
+    async def _clear_durable_active_turn(self, event):
+        self.released_with.append([row[1] for row in _rows()])
+        for attr in ("_gateway_active_turn_session_key", "_gateway_active_turn_token"):
+            if hasattr(event, attr):
+                delattr(event, attr)
+        return True
+
+
+def _marked_event():
+    """An event whose turn the runner marked active (``_mark_durable_active_turn``)."""
+    event = _event()
+    event._gateway_active_turn_session_key = "agent:main:slack:channel:C1"
+    event._gateway_active_turn_token = "turn-token"
+    return event
+
+
+class TestTurnMarkerHandoff:
+    """SW-1166 (port of upstream 360b9697ac): the adapter releases the crash-recovery marker of a
+    turn it delivers, and only once the reply is in the ledger. A marker cleared before that left a
+    persisted reply with neither marker nor ledger row; one never cleared re-sends a delivered reply
+    on the next unclean boot."""
+
+    @pytest.mark.asyncio
+    async def test_marker_released_once_the_reply_is_ledgered(self):
+        adapter = _Adapter()
+        adapter.gateway_runner = runner = _MarkerRunner()
+        event = _marked_event()
+        await _run(adapter, event)
+
+        assert adapter.sent == ["final answer"]
+        assert runner.released_with == [["attempting"]]  # ledgered before the send, released once
+        assert [row[1] for row in _rows()] == ["delivered"]
+        assert event._turn_marker_handoff is False
+
+    @pytest.mark.asyncio
+    async def test_marker_released_when_nothing_is_owed(self):
+        adapter = _Adapter()
+        adapter.gateway_runner = runner = _MarkerRunner()
+        await _run(adapter, _marked_event(), response=None)  # streamed or silent: no final send
+
+        assert adapter.sent == []
+        assert runner.released_with == [[]]

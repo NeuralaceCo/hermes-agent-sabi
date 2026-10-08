@@ -1280,8 +1280,11 @@ class GatewayInboundMixin:
             self._restore_moa_one_shot(event, _quick_key)
             self._restore_pending_one_turn_model_override(_quick_key)
             # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
-            # recovery pass.
-            await self._clear_durable_active_turn(event)
+            # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
+            # clears it only once the reply is in the delivery ledger (else a kill in between
+            # left neither marker nor ledger row and the persisted reply was never sent).
+            if not getattr(event, "_turn_marker_handoff", False):
+                await self._clear_durable_active_turn(event)
             # Unconditional, idempotent release without a run_generation guard: evicts the zombie
             # left when session_reset bumps the generation mid-flight (gen-N's guarded release in
             # _run_agent returns False; a sentinel-only check would lock forever).

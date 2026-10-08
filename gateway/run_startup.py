@@ -640,18 +640,62 @@ class GatewayStartupMixin:
         return discarded
 
     async def _recover_unclean_sessions(self) -> tuple[int, int]:
-        """Recover exact active turns, then run the legacy recency fallback."""
+        """Recover only the turns the dead process left marked: one whose reply is already in the
+        transcript is owed delivery, not a new answer; any other resumes once. An unmarked session
+        finished its turn (the marker is held until the reply is ledgered), so nothing re-runs it —
+        the old 120 s recency sweep re-answered every recently active chat. Returns (resumed,
+        ledgered)."""
         from gateway.run import _float_env
-        exact = 0
-        fallback = 0
+        resumed = ledgered = 0
+        max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
+        with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
+            ledgered = await self._ledger_crash_left_replies(max_age)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
-            agent_timeout = max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800))
-            exact = await self.async_session_store.recover_interrupted_turns(
-                max_age_seconds=max(60 * 60, int(agent_timeout * 2))
-            )
-        with _log_suppressed(logging.WARNING, "Legacy session recovery on startup failed: %s"):
-            fallback = await self.async_session_store.suspend_recently_active(max_age_seconds=120)
-        return exact, fallback
+            resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
+        return resumed, ledgered
+
+    async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
+        """Hand every marked turn whose final reply was persisted to the delivery ledger and clear
+        its marker, so the boot sweep delivers the stored reply instead of auto-resume
+        regenerating it. Without the ledger such turns stay marked and resume."""
+        from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+        from gateway.platforms.base import _strip_media_directives
+        from gateway.run import _sanitize_gateway_final_response
+        if not await asyncio.to_thread(ledger_enabled):
+            return 0
+        cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
+        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            # sabi: this pin's SessionEntry has no ``transport_profile`` (upstream added it later); a
+            # missing one ledgers under "default", the profile every non-multiplexed adapter owns.
+            marked = [
+                (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
+                 getattr(e, "transport_profile", None))
+                for e in self.session_store._entries.values()  # noqa: SLF001
+                if e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
+            ]
+        ledgered = 0
+        for key, session_id, token, started_at, origin, profile in marked:
+            history = await self.async_session_store.load_transcript(session_id)
+            last = next((m for m in reversed(history) if m.get("role") not in ("session_meta", "system")), None)
+            if (started_at.timestamp() < cutoff or not last or last.get("role") != "assistant"
+                    or last.get("tool_calls")
+                    or not isinstance(last.get("content"), str)
+                    or float(last.get("timestamp") or 0) < started_at.timestamp()):
+                continue  # the turn never produced its final reply: it resumes
+            text = _strip_media_directives(
+                _sanitize_gateway_final_response(origin.platform, last["content"])).strip()
+            if not text:
+                continue
+            await asyncio.to_thread(
+                record_crash_left_reply,
+                obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
+                platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
+                thread_id=origin.thread_id, content=text, since=started_at.timestamp(),
+                adapter_profile=profile)
+            if await self.async_session_store.clear_turn_active(key, token):
+                ledgered += 1
+        return ledgered
 
     @staticmethod
     def _start_hosted_room_worker_sync():
@@ -913,8 +957,8 @@ class GatewayStartupMixin:
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
-        # Recover sessions active at last exit (exact turn markers + 120s recency fallback for
-        # marker-less older turns). SKIP after a clean exit — the previous process already drained.
+        # Recover the turns the last process left marked (in flight, or reply not yet ledgered).
+        # SKIP after a clean exit — the previous process already drained.
         _clean_marker = _hermes_home / ".clean_shutdown"
         if _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")
@@ -929,11 +973,11 @@ class GatewayStartupMixin:
             if discarded:
                 logger.info("Discarded %d orphan active-turn marker(s) after clean shutdown", discarded)
         else:
-            exact, fallback = await self._recover_unclean_sessions()
-            if exact + fallback:
+            resumed, ledgered = await self._recover_unclean_sessions()
+            if resumed + ledgered:
                 logger.info(
-                    "Marked %d in-flight session(s) as resumable from previous run "
-                    "(%d exact, %d legacy)", exact + fallback, exact, fallback,
+                    "Recovered %d interrupted turn(s) from previous run (%d to resume, %d reply(ies) "
+                    "owed delivery)", resumed + ledgered, resumed, ledgered,
                 )
         # Stuck-loop detection: a session active across 3+ consecutive restarts is auto-suspended.
         with _log_suppressed(logging.DEBUG, "Stuck-loop detection failed: %s"):
