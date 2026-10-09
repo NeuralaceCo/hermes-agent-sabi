@@ -56,7 +56,10 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
             if use_keyless("exa", provider_env("EXA_API_KEY")):
                 return keyless_extract("Exa", "exa", urls, logger)
             logger.info("Exa extract: %d URL(s)", len(urls))
-            response = _get_exa_client().get_contents(urls, text=True)
+            # A copy at most an hour old. With no max_age_hours Exa serves its stored copy however
+            # old it is (a daily order-of-play PDF came back with the previous day's sheet).
+            # A fetch past livecrawl_timeout (Exa's default, pinned) gets the stored copy, not an error.
+            response = _get_exa_client().get_contents(urls, text=True, max_age_hours=1, livecrawl_timeout=10_000)
             return [document(r.url or "", r.title or "", r.text or "") for r in response.results or []]
 
         return run_extract("Exa", logger, urls, _body, sdk=True)
