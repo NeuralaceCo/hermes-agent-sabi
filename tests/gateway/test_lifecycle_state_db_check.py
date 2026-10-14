@@ -14,9 +14,14 @@ The check is gated on the unclean exit precisely because it costs ~2s on a
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import threading
 from pathlib import Path
 
+import pytest
+
+import gateway.lifecycle_ledger as ledger
 from gateway.lifecycle_ledger import (
     check_state_db_integrity,
     get_lifecycle_sentinel_path,
@@ -86,7 +91,8 @@ def test_checker_tolerates_a_missing_store(tmp_path: Path) -> None:
 # ── wiring into the unclean-exit path ───────────────────────────────────────
 
 
-def test_unclean_exit_records_the_corruption_verdict(tmp_path: Path) -> None:
+def test_unclean_exit_records_the_corruption_verdict(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_STARTUP_DB_CHECK", "blocking")
     _make_state_db(tmp_path, corrupt=True)
     _write_sentinel(tmp_path)
 
@@ -98,7 +104,8 @@ def test_unclean_exit_records_the_corruption_verdict(tmp_path: Path) -> None:
     assert record["state_db_integrity"] != "ok"
 
 
-def test_unclean_exit_on_a_healthy_store_records_ok(tmp_path: Path) -> None:
+def test_unclean_exit_on_a_healthy_store_records_ok(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_STARTUP_DB_CHECK", "blocking")
     _make_state_db(tmp_path, corrupt=False)
     _write_sentinel(tmp_path)
 
@@ -114,11 +121,97 @@ def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> N
     _write_sentinel(tmp_path, phase="exited")
 
     called = []
-    import gateway.lifecycle_ledger as ledger
-
     monkeypatch.setattr(
         ledger, "check_state_db_integrity", lambda **kw: called.append(1) or "ok"
     )
     record_startup(home=tmp_path)
 
     assert not called, "integrity check ran on a clean boot"
+
+
+# ── HERMES_STARTUP_DB_CHECK: when the check runs ────────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["blocking", "background"])
+def test_new_life_is_claimed_before_the_check_runs(tmp_path: Path, monkeypatch, mode: str) -> None:
+    """A boot killed mid-check must not leave the PREVIOUS life's "running"
+    sentinel behind, or the next boot pays the full check again."""
+    monkeypatch.setenv("HERMES_STARTUP_DB_CHECK", mode)
+    _make_state_db(tmp_path, corrupt=False)
+    _write_sentinel(tmp_path)
+    seen = []
+
+    def fake_check(**kw):
+        seen.append(json.loads(get_lifecycle_sentinel_path(tmp_path).read_text())["pid"])
+        return "ok"
+
+    monkeypatch.setattr(ledger, "check_state_db_integrity", fake_check)
+    record_startup(home=tmp_path)
+    if ledger._integrity_thread is not None:
+        ledger._integrity_thread.join(timeout=5)
+
+    assert seen == [os.getpid()]
+
+
+def test_background_check_does_not_block_startup(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_STARTUP_DB_CHECK", "background")
+    _write_sentinel(tmp_path)
+    release = threading.Event()
+    monkeypatch.setattr(
+        ledger, "check_state_db_integrity", lambda **kw: release.wait(5) and "*** in database main ***"
+    )
+
+    evidence = record_startup(home=tmp_path)  # returns while the check is parked
+
+    assert evidence is not None and evidence["state_db_integrity"] == "pending"
+    assert [r["tag"] for r in _exit_diag_records(tmp_path)] == ["gateway.previous_unclean_exit"]
+    release.set()
+    ledger._integrity_thread.join(timeout=5)
+    failure = _exit_diag_records(tmp_path)[-1]
+    assert failure["tag"] == "gateway.state_db_integrity_failed"
+    assert failure["state_db_integrity"] == "*** in database main ***"
+
+
+def test_background_check_on_a_real_torn_store_flags_failure(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_STARTUP_DB_CHECK", "background")
+    _make_state_db(tmp_path, corrupt=True)
+    _write_sentinel(tmp_path)
+
+    record_startup(home=tmp_path)
+    ledger._integrity_thread.join(timeout=30)
+
+    tags = [r["tag"] for r in _exit_diag_records(tmp_path)]
+    assert tags == ["gateway.previous_unclean_exit", "gateway.state_db_integrity_failed"]
+
+
+def test_background_check_on_a_healthy_store_adds_no_record(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_STARTUP_DB_CHECK", "background")
+    _make_state_db(tmp_path, corrupt=False)
+    _write_sentinel(tmp_path)
+
+    record_startup(home=tmp_path)
+    ledger._integrity_thread.join(timeout=30)
+
+    assert [r["tag"] for r in _exit_diag_records(tmp_path)] == ["gateway.previous_unclean_exit"]
+
+
+def test_off_skips_the_check_but_still_reports_the_death(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_STARTUP_DB_CHECK", "off")
+    _make_state_db(tmp_path, corrupt=True)
+    _write_sentinel(tmp_path)
+    called = []
+    monkeypatch.setattr(ledger, "check_state_db_integrity", lambda **kw: called.append(1) or "ok")
+
+    evidence = record_startup(home=tmp_path)
+
+    assert not called
+    assert evidence is not None and evidence["state_db_integrity"] == "skipped"
+    assert _exit_diag_records(tmp_path)[0]["state_db_integrity"] == "skipped"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("", "background"), ("BLOCKING", "blocking"), (" off ", "off"), ("sometimes", "background"),
+])
+def test_mode_parsing(monkeypatch, raw: str, expected: str) -> None:
+    monkeypatch.setenv("HERMES_STARTUP_DB_CHECK", raw)
+    assert ledger.startup_db_check_mode() == expected
