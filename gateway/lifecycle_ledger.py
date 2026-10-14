@@ -7,6 +7,11 @@ death (SIGKILL, kernel OOM, VM death) runs no handler.  A sentinel at
 unclean death, appended to the exit-diag log as ``gateway.previous_unclean_exit``
 and logged at WARNING; :func:`mark_exited` rewrites ``phase=exited`` on every
 clean exit path.  Best-effort: forensics must never affect the lifecycle.
+
+``HERMES_STARTUP_DB_CHECK`` picks when the post-unclean-exit ``state.db``
+``quick_check`` runs: ``background`` (default — a daemon thread, so the
+gateway binds its ports without waiting), ``blocking`` (inline, before any
+adapter connects) or ``off``.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from datetime import datetime, timezone
@@ -183,16 +189,56 @@ def check_state_db_integrity(home: Optional[Path] = None) -> str:
     return "check-failed: no result" if not row or row[0] is None else str(row[0])
 
 
+_DB_CHECK_MODES = ("background", "blocking", "off")
+
+
+def startup_db_check_mode() -> str:
+    """``HERMES_STARTUP_DB_CHECK`` normalised; unknown values fall back to ``background``."""
+    raw = os.environ.get("HERMES_STARTUP_DB_CHECK", "").strip().lower()
+    if raw and raw not in _DB_CHECK_MODES:
+        logger.warning("Ignoring HERMES_STARTUP_DB_CHECK=%r (expected one of %s)", raw, _DB_CHECK_MODES)
+    return raw if raw in _DB_CHECK_MODES else "background"
+
+
+# Handle on the most recent background check so tests (and shutdown code that
+# cares) can join it.  The thread is a daemon: a check still running at exit
+# must never hold the process up.
+_integrity_thread: Optional[threading.Thread] = None
+
+
+def _log_integrity_failure(verdict: str) -> None:
+    logger.error(
+        "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
+        "missing until it is repaired. Run `hermes doctor`.",
+        verdict,
+    )
+
+
+def _background_integrity_check(home: Optional[Path]) -> None:
+    started = time.monotonic()
+    verdict = check_state_db_integrity(home=home)
+    elapsed = round(time.monotonic() - started, 2)
+    if verdict in ("ok", "absent"):
+        logger.info("state.db integrity check after unclean exit: %s (%.2fs)", verdict, elapsed)
+        return
+    _log_integrity_failure(verdict)
+    _append_exit_diag({"ts": _now_iso(), "tag": "gateway.state_db_integrity_failed", "pid": os.getpid(),
+                       "state_db_integrity": verdict, "elapsed_s": elapsed}, home)
+
+
 def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None:
-    """Integrity-check the store, persist the exit-diag record, log at WARNING."""
+    """Integrity-check the store (per ``HERMES_STARTUP_DB_CHECK``), persist the
+    exit-diag record, log at WARNING."""
+    global _integrity_thread
     # The death may have torn the store; this is the only moment we know to look.
-    verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
-    if verdict not in ("ok", "absent"):
-        logger.error(
-            "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
-            "missing until it is repaired. Run `hermes doctor`.",
-            verdict,
-        )
+    mode = startup_db_check_mode()
+    if mode == "blocking":
+        verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
+        if verdict not in ("ok", "absent"):
+            _log_integrity_failure(verdict)
+    else:
+        # background: the verdict lands later as its own exit-diag record, only on failure.
+        evidence["state_db_integrity"] = "pending" if mode == "background" else "skipped"
     _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
     logger.warning(
         "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
@@ -200,16 +246,23 @@ def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None
         evidence.get("prior_pid"), evidence.get("prior_started_at"), evidence.get("last_heartbeat_at"),
         evidence.get("last_heartbeat_mem"), evidence.get("suspected_oom", False),
     )
+    if mode == "background":
+        _integrity_thread = threading.Thread(
+            target=_background_integrity_check, args=(home,), daemon=True, name="state-db-integrity-check")
+        _integrity_thread.start()
 
 
 def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """Boot entry point: report any unclean previous exit (evidence dict, also persisted
-    to ``gateway-exit-diag.log`` and logged at WARNING) then claim the sentinel.  Never raises."""
+    """Boot entry point: claim the sentinel for this life, then report any unclean
+    previous exit (evidence dict, also persisted to ``gateway-exit-diag.log`` and
+    logged at WARNING).  Never raises.
+
+    The claim is written FIRST so a boot killed during the report (the integrity
+    check can take minutes on a large store) is not itself mistaken for a
+    second unclean death that forces the check again on the next boot."""
     evidence: Optional[Dict[str, Any]] = None
     try:
         evidence = detect_unclean_exit(home)
-        if evidence is not None:
-            _report_unclean_exit(evidence, home)
     except Exception:
         logger.debug("Unclean-exit detection failed", exc_info=True)
     try:
@@ -224,6 +277,11 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
+    if evidence is not None:
+        try:
+            _report_unclean_exit(evidence, home)
+        except Exception:
+            logger.debug("Unclean-exit report failed", exc_info=True)
     return evidence
 
 
