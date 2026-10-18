@@ -823,6 +823,92 @@ class TestExternalSkillMutations:
             tmp_path / "manual-skill" / "SKILL.md"
         ).read_text(encoding="utf-8")
 
+
+# ---------------------------------------------------------------------------
+# skills.external_read_only (sabi): shipped external-dir skills are read-only
+# ---------------------------------------------------------------------------
+
+READ_ONLY = "is a shipped skill and is read-only"
+_SHIPPED_WRITES = {
+    "patch": {"action": "patch", "old_string": "OLD_MARKER", "new_string": "NEW"},
+    "patch-rewrite": {"action": "patch", "content": VALID_SKILL_CONTENT_2},
+    "edit": {"action": "edit", "content": VALID_SKILL_CONTENT_2},
+    "write_file": {"action": "write_file", "file_path": "references/new.md", "file_content": "x"},
+    "remove_file": {"action": "remove_file", "file_path": "references/slugs.md"},
+    "delete": {"action": "delete"},
+}
+
+
+def _cap_home(tmp_path, monkeypatch, *, read_only=None, create_dir_external=False) -> Path:
+    """cap-ts's sandbox layout on a real HERMES_HOME: local skills/ with create_dir skills/learned
+    inside it, shipped skills in cap-skills/ listed in skills.external_dirs."""
+    home = tmp_path / ".hermes"
+    learned = home / "skills" / "learned"
+    learned.mkdir(parents=True)
+    _write_external_skill(home / "skills", "my-local")
+    shipped = _write_external_skill(home / "cap-skills", "alia-gmail")
+    (shipped / "references").mkdir()
+    (shipped / "references" / "slugs.md").write_text("SLUGS\n")
+    externals = [home / "cap-skills", *([learned] if create_dir_external else [])]
+    (home / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n" + "".join(f"    - {d}\n" for d in externals)
+        + "  create_dir: skills/learned\n"
+        + ("" if read_only is None else f"  external_read_only: {read_only}\n"))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    import tools.skill_manager_tool as smt
+    from agent import skill_utils as su
+    monkeypatch.setattr(hermes_constants, "_hermes_home_cache", None, raising=False)
+    monkeypatch.setattr(smt, "SKILLS_DIR", home / "skills")
+    su._external_dirs_cache_clear()
+    return home
+
+
+def _tree(root: Path) -> dict:
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+class TestExternalReadOnly:
+    @pytest.mark.parametrize("op", sorted(_SHIPPED_WRITES))
+    def test_flag_on_refuses_every_write_to_a_shipped_skill(self, tmp_path, monkeypatch, op):
+        home = _cap_home(tmp_path, monkeypatch, read_only="true")
+        before = {d: _tree(home / d) for d in ("cap-skills", "skills/my-local")}
+        results = [json.loads(skill_manage(name="alia-gmail", **_SHIPPED_WRITES[op]))]
+        if op != "edit":  # legacy flat-only alias: the batch shape has no edit op
+            ops = [{"name": "alia-gmail", **_SHIPPED_WRITES[op]}]
+            if op != "delete":  # delete must be the sole op; others ride behind a local write that rolls back
+                ops.insert(0, {"name": "my-local", "action": "patch", "old_string": "OLD_MARKER", "new_string": "NEW"})
+            results.append(json.loads(skill_manage(action="", name="", operations=ops)))
+        for result in results:
+            assert result["success"] is False and READ_ONLY in result["error"], result
+        assert {d: _tree(home / d) for d in before} == before
+
+    @pytest.mark.parametrize("create_dir_external", [False, True])
+    def test_flag_on_keeps_local_and_create_dir_skills_writable(self, tmp_path, monkeypatch, create_dir_external):
+        home = _cap_home(tmp_path, monkeypatch, read_only="true", create_dir_external=create_dir_external)
+        created = json.loads(skill_manage(action="create", name="my-lesson", content=VALID_SKILL_CONTENT))
+        assert created["success"] is True, created
+        assert (home / "skills" / "learned" / "my-lesson" / "SKILL.md").is_file()
+        for name, old in (("my-lesson", "Do the thing."), ("my-local", "OLD_MARKER")):
+            patched = json.loads(skill_manage(action="patch", name=name, old_string=old, new_string="NEW"))
+            assert patched["success"] is True, patched
+
+    @pytest.mark.parametrize("read_only,lookup_fails", [(None, False), ("false", False), ("true", True)],
+                             ids=["unset", "false", "lookup-fails-open"])
+    def test_flag_off_or_unreadable_patches_shipped_skill_in_place(
+            self, tmp_path, monkeypatch, read_only, lookup_fails):
+        home = _cap_home(tmp_path, monkeypatch, read_only=read_only)
+        if lookup_fails:
+            def _boom(_path):
+                raise OSError("unreadable")
+            monkeypatch.setattr("agent.skill_utils.is_external_skill_path", _boom)
+        result = json.loads(skill_manage(
+            action="patch", name="alia-gmail", old_string="OLD_MARKER", new_string="NEW_MARKER"))
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (home / "cap-skills" / "alia-gmail" / "SKILL.md").read_text()
+        assert not (home / "skills" / "alia-gmail").exists()
+
+
 class TestBackgroundOwnershipPolicyConsistency:
     """The autonomous write policy must not depend on its own side effects.
 
