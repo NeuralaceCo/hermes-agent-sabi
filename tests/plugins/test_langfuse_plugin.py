@@ -2061,6 +2061,7 @@ class TestSystemPromptCrossesHookBoundary:
 
         def fake_child(state_, **kw):
             captured["input"] = kw.get("input_value")
+            captured["metadata"] = kw.get("metadata")
             return object()
 
         monkeypatch.setattr(mod, "_start_child_observation", fake_child)
@@ -2167,6 +2168,51 @@ class TestSystemPromptCrossesHookBoundary:
         self._derive_and_fire(mod, api_kwargs, api_kwargs["messages"])
         roles = [m["role"] for m in captured["input"]]
         assert roles.count("system") == 1
+
+    @staticmethod
+    def _skills_index(captured):
+        return {k: v for k, v in (captured["metadata"] or {}).items() if k.startswith("skills_index")}
+
+    def test_skills_index_counts_reach_generation_metadata(self, monkeypatch, tmp_path):
+        """sabi: the logged system prompt is cut before the skills menu, so each generation records
+        the menu's counts (all entries / from skills.external_dirs) in every request shape."""
+        from agent.prompt_builder import build_skills_system_prompt
+        from agent.transports.anthropic import AnthropicTransport
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        for root, name in ((home / "skills", "local-one"), (tmp_path / "shipped", "alia-a"),
+                           (tmp_path / "shipped", "alia-b")):
+            (root / name).mkdir(parents=True)
+            (root / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name}.\n---\nBody.\n")
+        (home / "config.yaml").write_text(f"skills:\n  external_dirs:\n    - {tmp_path / 'shipped'}\n")
+        system = f"You are Hermes.\n\n{build_skills_system_prompt()}\n\nConversation started: now"
+        api_messages = [{"role": "system", "content": system}, {"role": "user", "content": "hi"}]
+
+        mod = self._make_mod()
+        for api_kwargs in (AnthropicTransport().build_kwargs("claude-x", api_messages, None, max_tokens=64),
+                           {"messages": api_messages}):
+            captured = self._capture_generation(mod, monkeypatch)
+            self._derive_and_fire(mod, api_kwargs, api_messages)
+            assert self._skills_index(captured) == {"skills_index.total": 3, "skills_index.external": 2}
+
+    def test_skills_index_omitted_when_unknown_or_lookup_fails(self, monkeypatch):
+        api_messages = [{"role": "system", "content": "no menu here"}, {"role": "user", "content": "hi"}]
+        mod = self._make_mod()
+        captured = self._capture_generation(mod, monkeypatch)
+        self._derive_and_fire(mod, {"messages": api_messages}, api_messages)
+        assert self._skills_index(captured) == {}
+
+        def boom(_prompt):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("agent.prompt_builder.skills_index_counts", boom)
+        captured = self._capture_generation(mod, monkeypatch)
+        self._derive_and_fire(mod, {"messages": api_messages}, api_messages)
+        assert captured["input"][0]["role"] == "system"  # the generation is still recorded
+        assert self._skills_index(captured) == {}
+
+
 class TestFinishTraceUsesUpdateTrace:
     """Regression: SDK v3 has update_trace, not set_trace_io.
 

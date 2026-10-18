@@ -23,8 +23,8 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS, ORG_ACTIVE_MARKER, ORG_MIRROR_DIR_NAME, ORG_PROVENANCE_FILE, SKILL_SUPPORT_DIRS,
     extract_skill_conditions, extract_skill_description, get_all_skills_dirs, get_disabled_skill_names,
-    iter_skill_index_files, parse_frontmatter, read_active_org_id, skill_matches_environment,
-    skill_matches_platform, skill_matches_platform_list,
+    get_external_skills_dirs, iter_skill_index_files, parse_frontmatter, read_active_org_id,
+    skill_matches_environment, skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 from utils import atomic_json_write
@@ -1086,6 +1086,39 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
         logger.debug("Could not remove skills prompt snapshot: %s", e)
 
 
+# sabi: rendered menu -> (entries on it, entries from skills.external_dirs), filled when a menu is built.
+# Telemetry only: logged system prompts are cut before the menu, so the Langfuse plugin looks the menu up
+# in each request's system prompt. Not cleared with the cache above: a continuing session keeps sending
+# the menu it started with, and that menu's counts never change.
+_SKILLS_INDEX_COUNTS: OrderedDict[str, tuple[int, int]] = OrderedDict()
+
+
+def _record_skills_index_counts(menu: str, skills_by_category: dict[str, list[tuple[str, str]]],
+                                added_by_dir: dict[Path, int]) -> None:
+    """Remember *menu*'s counts. The builder's extra dirs include create_dir, so only real
+    ``skills.external_dirs`` roots count as external. Never raises."""
+    try:
+        external_roots = set(get_external_skills_dirs())
+        counts = (sum(len({name for name, _ in entries}) for entries in skills_by_category.values()),
+                  sum(n for d, n in added_by_dir.items() if d in external_roots))
+        with _SKILLS_PROMPT_CACHE_LOCK:
+            _SKILLS_INDEX_COUNTS[menu] = counts
+            _SKILLS_INDEX_COUNTS.move_to_end(menu)
+            while len(_SKILLS_INDEX_COUNTS) > _SKILLS_PROMPT_CACHE_MAX:
+                _SKILLS_INDEX_COUNTS.popitem(last=False)
+    except Exception:
+        logger.debug("skills index counts skipped", exc_info=True)
+
+
+def skills_index_counts(system_prompt: str) -> Optional[tuple[int, int]]:
+    """``(entries, external entries)`` of the skills menu inside *system_prompt*, or None when this
+    process never rendered that menu (a session restored after a restart, until a rebuild).
+    One substring scan per known menu: ~40 us each on a 90 KB prompt."""
+    with _SKILLS_PROMPT_CACHE_LOCK:
+        known = list(_SKILLS_INDEX_COUNTS.items())
+    return next((counts for menu, counts in reversed(known) if menu in system_prompt), None)
+
+
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     """mtime/size manifest of every SKILL.md and DESCRIPTION.md; only the ACTIVE org mirror participates, and
     the ``.active_org`` marker is included so switching/leaving an org invalidates the snapshot by itself."""
@@ -1403,13 +1436,18 @@ def _build_skills_system_prompt_inner(
 
     # External skill directories: scanned directly (read-only, small); names already indexed are skipped.
     seen_skill_names: set[str] = {name for cat in skills_by_category.values() for name, _ in cat}
+    added_by_dir: dict[Path, int] = {}  # menu entries each dir added (every added name is new)
     for ext_dir in (d for d in external_dirs if d.exists()):
+        before = len(seen_skill_names)
         _collect_extra_skills(ext_dir, iter_skill_index_files(ext_dir, "SKILL.md"), hides, seen_skill_names,
                               skills_by_category, desc_prefix="", log_fmt="Error reading external skill %s: %s")
+        added_by_dir[ext_dir] = len(seen_skill_names) - before
         for cat, cat_desc in _read_category_descriptions(ext_dir, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
 
     result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    if result:
+        _record_skills_index_counts(result, skills_by_category, added_by_dir)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

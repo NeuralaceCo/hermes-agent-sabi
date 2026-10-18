@@ -394,6 +394,28 @@ class TestBuildSkillsSystemPrompt:
         second = build_skills_system_prompt()
         assert "cached-skill" not in second
 
+    def test_skills_index_counts_entries_by_source(self, monkeypatch, tmp_path):
+        """sabi: counts go by the dir an entry came from, never its name: an agent-made alia-* skill
+        is local, create_dir entries are not external, and a shipped skill shadowed by a local one
+        is not on the menu at all."""
+        from agent.prompt_builder import clear_skills_system_prompt_cache, skills_index_counts
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        for root, name in ((home / "skills", "alia-mine"), (home / "skills", "shared"),
+                           (tmp_path / "learned", "lesson"), (tmp_path / "cap-skills", "alia-gmail"),
+                           (tmp_path / "cap-skills", "alia-slack"), (tmp_path / "cap-skills", "shared")):
+            (root / name).mkdir(parents=True)
+            (root / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name} skill.\n---\nBody.\n")
+        (home / "config.yaml").write_text(
+            f"skills:\n  create_dir: {tmp_path / 'learned'}\n  external_dirs:\n    - {tmp_path / 'cap-skills'}\n")
+
+        menu = build_skills_system_prompt()
+        assert skills_index_counts(f"You are Hermes.\n\n{menu}\n\nConversation started: now") == (5, 2)
+        assert skills_index_counts("You are Hermes.") is None
+        # A continuing session keeps sending the menu it started with, after any cache clear.
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        assert skills_index_counts(menu) == (5, 2)
+
 
 # =========================================================================
 # Context files prompt builder
