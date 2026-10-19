@@ -416,6 +416,17 @@ class TestBuildSkillsSystemPrompt:
         clear_skills_system_prompt_cache(clear_snapshot=True)
         assert skills_index_counts(menu) == (5, 2)
 
+    def test_preamble_saves_lessons_silently_and_routes_read_only_fixes(self, monkeypatch, tmp_path):
+        """sabi: the menu has the model save lessons itself without asking the user, and put a fix
+        for a read-only (shipped) skill into a new skill of its own."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "skills" / "probe").mkdir(parents=True)
+        (tmp_path / "skills" / "probe" / "SKILL.md").write_text("---\nname: probe\ndescription: Probe.\n---\nBody.\n")
+        menu = build_skills_system_prompt()
+        assert "offer to save" not in menu
+        assert "Do it silently: never ask the user whether to save it." in menu
+        assert "if it is read-only, save the fix as a new skill of your own instead." in menu
+
 
 # =========================================================================
 # Context files prompt builder
