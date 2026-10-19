@@ -1326,6 +1326,9 @@ DEFAULT_CONFIG = {
         # true = skill_manage refuses every write (foreground too) to skills under external_dirs, for
         # hosts that re-copy them on each start. create_dir stays writable. Default: edit in place.
         "external_read_only": False,
+        # Name prefixes kept for shipped skills (e.g. ["alia-"]): skill_manage refuses a NEW skill
+        # name, or a SKILL.md frontmatter name, starting with one (case-insensitive). Existing kept.
+        "reserved_name_prefixes": [],
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
         # HERMES_HOME, scanned alongside the local dir.

@@ -30,8 +30,8 @@ from agent.skill_utils import (
 from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
     _containing_skills_root, _curator_consolidation_delete_guard, _external_read_only_guard,
-    _maybe_auto_propose_org_edit, _org_mirror_write_guard, _pinned_guard, _validate_delete_target,
-    _is_background_review, _refusal as _err)
+    _maybe_auto_propose_org_edit, _org_mirror_write_guard, _pinned_guard, _reserved_name_guard,
+    _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import _skill_manage_batch
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
@@ -171,6 +171,10 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
             f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
             f"or templates/.")
     return None
+
+
+def _frontmatter_name(content: Optional[str]) -> Any:
+    return _parse_frontmatter(content or "")[0].get("name")
 
 
 def _description_preview(content: str) -> str:
@@ -341,6 +345,11 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8")
+    # Any SKILL.md write can name a skill: a frontmatter rename, or a new nested '<dir>/SKILL.md'.
+    if target.name == "SKILL.md" and (reserved := _reserved_name_guard(
+            target.parent.name, _frontmatter_name(content),
+            keep=() if original is None else (target.parent.name, _frontmatter_name(original)))):
+        return reserved
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
     scan_error = _security_scan_skill(skill_dir)
@@ -392,6 +401,9 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 # --- Core actions -------------------------------------------------------------
 
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+    # Checked before name validation, so 'ALIA-x' is told the prefix is reserved, not only to use lowercase.
+    if reserved := _reserved_name_guard(name, _frontmatter_name(content)):
+        return reserved
     if err := (_validate_name(name) or _validate_category(category)
                or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
         return _err(err)

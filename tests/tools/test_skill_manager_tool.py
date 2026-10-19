@@ -839,9 +839,9 @@ _SHIPPED_WRITES = {
 }
 
 
-def _cap_home(tmp_path, monkeypatch, *, read_only=None, create_dir_external=False) -> Path:
+def _cap_home(tmp_path, monkeypatch, *, read_only=None, create_dir_external=False, extra="") -> Path:
     """cap-ts's sandbox layout on a real HERMES_HOME: local skills/ with create_dir skills/learned
-    inside it, shipped skills in cap-skills/ listed in skills.external_dirs."""
+    inside it, shipped skills in cap-skills/ listed in skills.external_dirs. *extra* = more skills: lines."""
     home = tmp_path / ".hermes"
     learned = home / "skills" / "learned"
     learned.mkdir(parents=True)
@@ -853,7 +853,7 @@ def _cap_home(tmp_path, monkeypatch, *, read_only=None, create_dir_external=Fals
     (home / "config.yaml").write_text(
         "skills:\n  external_dirs:\n" + "".join(f"    - {d}\n" for d in externals)
         + "  create_dir: skills/learned\n"
-        + ("" if read_only is None else f"  external_read_only: {read_only}\n"))
+        + ("" if read_only is None else f"  external_read_only: {read_only}\n") + extra)
     monkeypatch.setenv("HERMES_HOME", str(home))
     import hermes_constants
     import tools.skill_manager_tool as smt
@@ -907,6 +907,65 @@ class TestExternalReadOnly:
         assert result["success"] is True, result
         assert "NEW_MARKER" in (home / "cap-skills" / "alia-gmail" / "SKILL.md").read_text()
         assert not (home / "skills" / "alia-gmail").exists()
+
+
+RESERVED = "which is reserved for skills shipped with the app"
+_RESERVE_ALIA = '  reserved_name_prefixes: ["alia-"]\n'
+
+
+def _skill_text(name: str) -> str:
+    return f"---\nname: {name}\ndescription: Use when testing reserved names.\n---\n\nBody OLD_MARKER.\n"
+
+
+class TestReservedNamePrefixes:
+    @pytest.mark.parametrize("name,fm_name,reserved", [
+        ("alia-foo", "alia-foo", True),
+        ("ALIA-foo", "ALIA-foo", True),
+        ("foo-notes", "Alia-foo", True),  # the menu and skill_view also answer to the frontmatter name
+        ("aliafoo", "aliafoo", False),
+        ("my-alia-notes", "my-alia-notes", False),
+    ])
+    def test_set_create_refuses_reserved_names_in_any_case(self, tmp_path, monkeypatch, name, fm_name, reserved):
+        home = _cap_home(tmp_path, monkeypatch, extra=_RESERVE_ALIA)
+        result = json.loads(skill_manage(action="create", name=name, content=_skill_text(fm_name)))
+        assert result["success"] is not reserved, result
+        assert (RESERVED in result.get("error", "")) is reserved
+        assert (home / "skills" / "learned" / name).exists() is not reserved
+
+    def test_unset_create_allows_the_prefix(self, tmp_path, monkeypatch):
+        home = _cap_home(tmp_path, monkeypatch)
+        result = json.loads(skill_manage(action="create", name="alia-foo", content=_skill_text("alia-foo")))
+        assert result["success"] is True, result
+        assert (home / "skills" / "learned" / "alia-foo" / "SKILL.md").is_file()
+
+    def test_set_covers_batch_curator_and_rename_paths_but_keeps_existing_names(self, tmp_path, monkeypatch):
+        from tools.skill_provenance import BACKGROUND_REVIEW, reset_current_write_origin, set_current_write_origin
+        home = _cap_home(tmp_path, monkeypatch, extra=_RESERVE_ALIA)
+        _write_external_skill(home / "skills" / "learned", "alia-mine")  # agent-made before the reservation
+        before = {d: _tree(home / "skills" / d) for d in ("my-local", "learned")}
+        token = set_current_write_origin(BACKGROUND_REVIEW)  # the curator's consolidation fork
+        try:
+            curator_create = skill_manage(action="create", name="alia-umbrella", content=_skill_text("alia-umbrella"))
+        finally:
+            reset_current_write_origin(token)
+        attempts = [
+            curator_create,
+            skill_manage(action="", name="", operations=[
+                {"name": "alia-bar", "action": "create", "content": _skill_text("alia-bar")}]),
+            # Renaming a skill through its frontmatter, by patch, rewrite or write_file.
+            skill_manage(action="patch", name="my-local", old_string="name: my-local", new_string="name: alia-x"),
+            skill_manage(action="edit", name="my-local", content=_skill_text("alia-x")),
+            skill_manage(action="write_file", name="my-local", file_path="SKILL.md", file_content=_skill_text("alia-x")),
+            # A nested '<dir>/SKILL.md' is a new skill of its own.
+            skill_manage(action="write_file", name="my-local", file_path="alia-nested/SKILL.md",
+                         file_content=_skill_text("nested")),
+        ]
+        for raw in attempts:
+            result = json.loads(raw)
+            assert result["success"] is False and RESERVED in result["error"], result
+        assert {d: _tree(home / "skills" / d) for d in before} == before
+        kept = json.loads(skill_manage(action="patch", name="alia-mine", old_string="OLD_MARKER", new_string="NEW"))
+        assert kept["success"] is True, kept
 
 
 class TestBackgroundOwnershipPolicyConsistency:
