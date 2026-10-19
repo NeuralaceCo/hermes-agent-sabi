@@ -1329,6 +1329,10 @@ DEFAULT_CONFIG = {
         # Name prefixes kept for shipped skills (e.g. ["alia-"]): skill_manage refuses a NEW skill
         # name, or a SKILL.md frontmatter name, starting with one (case-insensitive). Existing kept.
         "reserved_name_prefixes": [],
+        # true = a skill the agent creates in a normal turn (create, or a new nested <dir>/SKILL.md)
+        # is curator-managed like a background-review create, so the curator can archive it once
+        # unused. Never external_dirs; existing records kept. Default: foreground creates are the user's.
+        "curate_agent_skills": False,
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
         # HERMES_HOME, scanned alongside the local dir.

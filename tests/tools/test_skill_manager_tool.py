@@ -968,6 +968,88 @@ class TestReservedNamePrefixes:
         assert kept["success"] is True, kept
 
 
+_CURATE = "  curate_agent_skills: true\n"
+
+
+def _agent_creates() -> list:
+    """A foreground create, flat and batched, and a new nested '<dir>/SKILL.md' from write_file."""
+    return [
+        skill_manage(action="create", name="flat-lesson", content=_skill_text("flat-lesson")),
+        skill_manage(action="", name="", operations=[
+            {"name": "batch-lesson", "action": "create", "content": _skill_text("batch-lesson")}]),
+        skill_manage(action="write_file", name="my-local", file_path="nested-lesson/SKILL.md",
+                     file_content=_skill_text("nested-lesson")),
+    ]
+
+
+def _assert_all_succeed(raws) -> None:
+    for raw in raws:
+        result = json.loads(raw)
+        assert result["success"] is True and "_new_skill_md" not in result, result
+
+
+class TestCurateAgentSkills:
+    def test_on_foreground_creates_are_curator_managed_and_stay_so(self, tmp_path, monkeypatch):
+        from tools import skill_usage
+        _cap_home(tmp_path, monkeypatch, extra=_CURATE)
+        _assert_all_succeed(_agent_creates() + [
+            skill_manage(action="patch", name="flat-lesson", old_string="OLD_MARKER", new_string="NEW"),
+            skill_manage(action="edit", name="batch-lesson", content=_skill_text("batch-lesson") + "More.\n")])
+        assert skill_usage.list_agent_created_skill_names() == ["batch-lesson", "flat-lesson", "nested-lesson"]
+
+    @pytest.mark.parametrize("extra,lookup_fails", [("", False), ("  curate_agent_skills: false\n", False),
+                                                    (_CURATE, True)], ids=["unset", "false", "lookup-fails"])
+    def test_off_or_unreadable_foreground_creates_stay_user_owned(self, tmp_path, monkeypatch, extra, lookup_fails):
+        from agent import skill_utils as su
+        from tools import skill_usage
+        _cap_home(tmp_path, monkeypatch, extra=extra)
+        if lookup_fails:
+            real = su._skills_cfg_get
+            def _cfg(key):
+                if key == "curate_agent_skills":
+                    raise OSError("unreadable")
+                return real(key)
+            monkeypatch.setattr(su, "_skills_cfg_get", _cfg)
+        _assert_all_succeed(_agent_creates())
+        usage = skill_usage.load_usage()
+        assert usage["flat-lesson"]["created_by"] is None and usage["batch-lesson"]["created_by"] is None
+        assert "nested-lesson" not in usage  # upstream records nothing for a nested skill
+        assert skill_usage.list_agent_created_skill_names() == []
+
+    def test_on_skills_in_external_dirs_are_never_curator_managed(self, tmp_path, monkeypatch):
+        from tools import skill_usage
+        home = _cap_home(tmp_path, monkeypatch, create_dir_external=True, extra=_CURATE)  # learned/ is external
+        _assert_all_succeed([
+            skill_manage(action="create", name="ext-lesson", content=_skill_text("ext-lesson")),
+            skill_manage(action="write_file", name="alia-gmail", file_path="ext-nested/SKILL.md",
+                         file_content=_skill_text("ext-nested"))])
+        assert (home / "skills" / "learned" / "ext-lesson" / "SKILL.md").is_file()
+        assert (home / "cap-skills" / "alia-gmail" / "ext-nested" / "SKILL.md").is_file()
+        assert skill_usage.list_agent_created_skill_names() == []
+        assert not any(map(skill_usage.is_curator_managed, ("ext-lesson", "ext-nested", "alia-gmail")))
+
+    def test_on_existing_skills_keep_their_records(self, tmp_path, monkeypatch):
+        """Nothing that exists is handed to the curator: the skill written to, a nested skill it
+        overwrites, a skill already answering to the new name, or a record whose skill is off disk."""
+        from tools import skill_usage
+        home = _cap_home(tmp_path, monkeypatch, extra=_CURATE)
+        for rel, fm_name in (("my-local/old-nested", "old-nested"), ("notes-dir", "notes")):
+            (home / "skills" / rel).mkdir()
+            (home / "skills" / rel / "SKILL.md").write_text(_skill_text(fm_name))
+        skill_usage.bump_view("my-local")  # user-owned, with history
+        skill_usage.bump_view("gone")  # archived, or removed by hand
+        nested = [("old-nested", "old-nested"), ("notes-copy", "notes"), ("gone", "gone"),
+                  ("my-local", "my-local")]  # last: '<skill>/SKILL.md' lands as a second, nested 'my-local'
+        _assert_all_succeed([
+            skill_manage(action="patch", name="my-local", old_string="OLD_MARKER", new_string="NEW"),
+            *(skill_manage(action="write_file", name="my-local", file_path=f"{d}/SKILL.md",
+                           file_content=_skill_text(fm_name)) for d, fm_name in nested),
+            skill_manage(action="create", name="notes", content=_skill_text("notes"))])
+        assert (home / "skills" / "my-local" / "my-local" / "SKILL.md").is_file()
+        assert skill_usage.list_agent_created_skill_names() == []
+        assert [skill_usage.get_record(n)["view_count"] for n in ("my-local", "gone")] == [1, 1]
+
+
 class TestBackgroundOwnershipPolicyConsistency:
     """The autonomous write policy must not depend on its own side effects.
 

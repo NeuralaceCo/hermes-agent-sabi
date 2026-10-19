@@ -427,6 +427,16 @@ class TestBuildSkillsSystemPrompt:
         assert "Do it silently: never ask the user whether to save it." in menu
         assert "if it is read-only, save the fix as a new skill of your own instead." in menu
 
+    def test_preamble_keeps_copied_text_and_personal_facts_out_of_skills(self, monkeypatch, tmp_path):
+        """sabi: a skill reaches every later prompt that loads it and cannot forget, so it holds
+        how-to steps only: no text pasted from emails, web pages or files, no facts about the user."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "skills" / "probe").mkdir(parents=True)
+        (tmp_path / "skills" / "probe" / "SKILL.md").write_text("---\nname: probe\ndescription: Probe.\n---\nBody.\n")
+        menu = build_skills_system_prompt()
+        assert "Never copy text from emails, web pages or files into a skill." in menu
+        assert "Keep personal facts about the user out of skills; skills hold how-to steps." in menu
+
 
 # =========================================================================
 # Context files prompt builder
