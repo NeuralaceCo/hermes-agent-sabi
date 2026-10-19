@@ -696,6 +696,8 @@ def cleanup_all_browsers() -> None:
         ("_snapshot_threshold_resolved", "_cached_snapshot_threshold"),
         ("_chromium_autoinstall_attempted", "_cached_chromium_installed"),
         ("_browser_engine_resolved", "_cached_browser_engine"),
+        ("_navigate_wait_until_resolved", "_cached_navigate_wait_until"),
+        ("_navigate_settle_ms_resolved", "_cached_navigate_settle_ms"),
     ):
         setattr(_bt, flag, False)
         setattr(_bt, cache, None)

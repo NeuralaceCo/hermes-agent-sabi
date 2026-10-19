@@ -612,3 +612,146 @@ def _run_browser_command(
         return _lp._annotate_lightpanda_fallback(fallback_result, fallback_reason)
 
     return result
+
+
+# agent-browser's CLI names the daemon session "default" unless --session/AGENT_BROWSER_SESSION
+# is given, and cloud/CDP sessions never pass --session (see _run_browser_command).
+_CDP_DAEMON_SESSION = "default"
+# Client-side slack on top of the daemon-bounded settle wait, so a daemon that never
+# answers still cannot hold browser_navigate longer than settle + this.
+_SETTLE_GRACE_S = 5.0
+# Schemes agent-browser's CLI ``open`` passes through unchanged; anything else gets
+# ``https://`` prepended (cli/src/commands.rs, the "open" | "goto" | "navigate" arm).
+_CLI_OPEN_PASSTHROUGH_SCHEMES = ("http://", "https://", "about:", "data:", "file:",
+                                 "chrome-extension://", "chrome://")
+
+
+def _cli_open_url(url: str) -> str:
+    """The URL exactly as the CLI ``open`` would send it to the daemon."""
+    return url if url.lower().startswith(_CLI_OPEN_PASSTHROUGH_SCHEMES) else f"https://{url}"
+
+
+def _daemon_socket_supported() -> bool:
+    import socket as socket_mod
+
+    return os.name != "nt" and hasattr(socket_mod, "AF_UNIX")
+
+
+def _daemon_connect(socket_dir: str, timeout: float):
+    """Connected socket to the session's agent-browser daemon. Raises OSError before anything
+    is sent, which is the only failure a caller may safely retry another way."""
+    import socket as socket_mod
+
+    s = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect(os.path.join(socket_dir, f"{_CDP_DAEMON_SESSION}.sock"))
+    except OSError:
+        s.close()
+        raise
+    return s
+
+
+def _daemon_exchange(sock, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """One newline-delimited JSON request/response on a connected daemon socket: the same
+    envelope, framing and daemon-side action policy as the CLI (connection.rs send_command_once)."""
+    with sock:
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    if not buf.strip():
+        return {"success": False, "error": "agent-browser daemon closed the connection without a response"}
+    return json.loads(buf)
+
+
+def _run_navigate(task_id: str, url: str, timeout: int) -> Dict[str, Any]:
+    """Navigate the task's browser. ``browser.navigate_wait_until: load`` (default) and local
+    sessions use the CLI ``open`` (waits for the full load event). Otherwise, on a cloud/CDP
+    session, send ``navigate`` with that waitUntil straight to the daemon socket, then an
+    optional network-idle settle bounded daemon-side by ``browser.navigate_settle_ms``.
+    A cold daemon is started and attached by a CLI ``open about:blank`` first."""
+    wait_until = _bt.get_navigate_wait_until()
+    if wait_until == "load":
+        return _run_browser_command(task_id, "open", [url], timeout=timeout)
+    try:
+        session_info = _get_session_info(task_id)
+    except Exception as e:
+        _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
+        return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
+    # Local sessions, Lightpanda (its Chrome fallback lives in the CLI path) and platforms
+    # without Unix sockets (native Windows: the daemon listens on a named pipe) keep CLI open.
+    if (not _daemon_socket_supported()
+            or not session_info.get("cdp_url")
+            or (session_info.get("features") or {}).get("lightpanda")
+            or _cloud._get_browser_engine() == "lightpanda"):
+        return _run_browser_command(task_id, "open", [url], timeout=timeout)
+
+    socket_dir = _prepare_session_socket_dir(session_info["session_name"])
+    if not _browser_daemon_responsive(socket_dir):
+        warm = _run_browser_command(task_id, "open", ["about:blank"], timeout=timeout)
+        if not warm.get("success"):
+            return warm
+    _cdp._ensure_cdp_supervisor(task_id)
+
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"success": False, "error": "Interrupted"}
+    try:
+        sock = _daemon_connect(socket_dir, timeout)
+    except OSError as e:
+        # Nothing was sent, so the CLI path cannot double-navigate.
+        _bt.logger.warning("agent-browser daemon socket unreachable (task=%s): %s; using CLI open", task_id, e)
+        return _run_browser_command(task_id, "open", [url], timeout=timeout)
+
+    request_id = uuid.uuid4().hex[:12]
+    try:
+        result = _daemon_exchange(sock, {"id": request_id, "action": "navigate", "url": _cli_open_url(url),
+                                         "waitUntil": wait_until})
+    except TimeoutError:
+        _handle_browser_command_timeout(task_id, session_info, socket_dir)
+        _bt.logger.warning("browser navigate timed out after %ds (task=%s)", timeout, task_id)
+        return {"success": False, "error": f"Command timed out after {timeout} seconds"}
+    except (OSError, ValueError) as e:
+        # The request may already be running: report, never retry (a retry could navigate twice).
+        _bt.logger.warning("browser navigate via daemon socket failed after send (task=%s): %s", task_id, e)
+        return {"success": False, "error": f"Navigation failed: {e}"}
+    if not result.get("success"):
+        return {"success": False, "error": result.get("error") or "Navigation failed"}
+
+    data = dict(result.get("data") or {})
+    settle_ms = _bt.get_navigate_settle_ms()
+    if settle_ms > 0:
+        try:
+            settled = _daemon_exchange(
+                _daemon_connect(socket_dir, settle_ms / 1000 + _SETTLE_GRACE_S),
+                {"id": f"{request_id}-settle", "action": "waitforloadstate", "state": "networkidle",
+                 "timeout": settle_ms},
+            )
+            if not settled.get("success"):
+                _bt.logger.debug("navigate settle capped at %d ms (task=%s): %s",
+                                 settle_ms, task_id, settled.get("error"))
+        except (OSError, ValueError) as e:
+            _bt.logger.info("navigate settle skipped (task=%s): %s", task_id, e)
+        # The page may have redirected while settling: the caller's post-redirect check and
+        # the auto-snapshot must see the URL the page is on now, so fail closed if unreadable.
+        current_url = _daemon_current_url(socket_dir, f"{request_id}-url")
+        if current_url is None:
+            return {"success": False, "error": "Navigation failed: could not confirm the page URL after settling"}
+        data["url"] = current_url
+    return {"success": True, "data": data}
+
+
+def _daemon_current_url(socket_dir: str, request_id: str) -> Optional[str]:
+    """The daemon's current page URL, or None if it cannot be read."""
+    try:
+        reply = _daemon_exchange(_daemon_connect(socket_dir, _SETTLE_GRACE_S),
+                                 {"id": request_id, "action": "url"})
+    except (OSError, ValueError) as e:
+        _bt.logger.warning("could not read page URL from agent-browser daemon: %s", e)
+        return None
+    url = (reply.get("data") or {}).get("url") if reply.get("success") else None
+    return url if isinstance(url, str) and url else None
