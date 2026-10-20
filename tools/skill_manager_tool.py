@@ -345,7 +345,7 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8")
-    # Any SKILL.md write can name a skill: a frontmatter rename, or a new nested '<dir>/SKILL.md'.
+    # Any SKILL.md write can rename a skill through its frontmatter.
     if target.name == "SKILL.md" and (reserved := _reserved_name_guard(
             target.parent.name, _frontmatter_name(content),
             keep=() if original is None else (target.parent.name, _frontmatter_name(original)))):
@@ -553,15 +553,18 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if guard:
         return guard
     target, err = _resolve_supporting_file(skill_dir, file_path)
-    if err:
-        return err
-    new_skill = target.name == "SKILL.md" and target.parent != skill_dir and not target.exists()
-    if guard := _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
+    # sabi: discovery indexes a nested '<dir>/SKILL.md' as another skill, one that bypasses create; a
+    # same-name one makes skill_view ambiguous. Not in _validate_file_path, so remove_file can delete one.
+    if not err and target.name == "SKILL.md" and target.parent != skill_dir:
+        root = _skills_dir()  # the display form create uses for "path"
+        shown = target.relative_to(root) if target.is_relative_to(root) else target
+        return _err(f"Not written: file_path is relative to this skill's folder, so '{file_path}' would create "
+                    f"a skill inside it, at {shown}. To change this skill's main file, use file_path 'SKILL.md' "
+                    "or action 'patch'. To make a new skill, use action 'create'.")
+    if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
         return guard
     result = _attach_org_note({"success": True, "message": f"File '{file_path}' written to skill '{name}'.",
                                "path": str(target)}, name, skill_dir)
-    if new_skill:  # a new nested '<dir>/SKILL.md' is a skill of its own; _record_success consumes this
-        result["_new_skill_md"] = str(target)
     # references/ is where per-session hoarding shows up; surface the sprawl finding on the write
     # that crosses the line so the review fork sees it in the same turn.
     if file_path.startswith("references/") and (skill_dir / "SKILL.md").exists():
@@ -711,24 +714,18 @@ _REQUIRED_ARGS = {
     "remove_file": [("file_path", _MISSING, "file_path is required for 'remove_file'.")]}
 
 
-def _agent_skill_to_curate(skill_md, name: Optional[str] = None) -> Optional[str]:
+def _agent_skill_to_curate(skill_md, name: str) -> Optional[str]:
     """sabi: ``skills.curate_agent_skills`` (default off) records a skill the agent brings into being
     in a normal turn as curator-managed, like a background-review create, so the curator marks it
     stale and archives it once unused. Returns the name to record it under, or None: setting off or
     unreadable, skill in an external dir, or another skill already answers to the name (the record
-    would hand that one to the curator too). *name* None = a nested SKILL.md from write_file, keyed
-    the way the curator names it, which must have no usage record yet."""
+    would hand that one to the curator too)."""
     try:
         from agent.skill_utils import _skills_cfg_get, get_all_skills_dirs, is_external_skill_path
-        from tools import skill_usage
         from tools.skills_tool import _collect_skill_candidates
         if not is_truthy_value(_skills_cfg_get("curate_agent_skills")) or is_external_skill_path(skill_md):
             return None
         skill_md = Path(skill_md)
-        if name is None:
-            name = skill_usage._read_skill_name(skill_md, fallback=skill_md.parent.name)
-            if _validate_name(name) or name in skill_usage.load_usage():
-                return None
         found = {md.resolve() for _, md in _collect_skill_candidates(name, None, get_all_skills_dirs())}
         return name if found == {skill_md.resolve()} else None
     except Exception:
@@ -740,7 +737,6 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
                     session_id, ledger_before) -> None:
     """Best-effort post-mutation side effects (never break the tool): ledger, prompt-cache
     clear, curator telemetry, debounced sync push."""
-    new_skill_md = result.pop("_new_skill_md", None)
     with suppress(Exception):
         from tools import skill_ledger as _ledger
         _post = _find_skill(name)
@@ -771,8 +767,6 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
                 _agent_skill_to_curate(result["skill_md"], name)), task_id=task_id, session_id=session_id)
         elif action in {"patch", "edit", "write_file", "remove_file"}:
             bump_patch(name, action=action, task_id=task_id, session_id=session_id)
-            if new_skill_md and (nested := _agent_skill_to_curate(new_skill_md)):
-                record_created(nested, agent_created=True, task_id=task_id, session_id=session_id)
         elif action == "delete" and not result.get("_archived"):
             forget(name)
     # Only AFTER the write gate passed (staged writes returned early): never push un-reviewed content.

@@ -956,9 +956,6 @@ class TestReservedNamePrefixes:
             skill_manage(action="patch", name="my-local", old_string="name: my-local", new_string="name: alia-x"),
             skill_manage(action="edit", name="my-local", content=_skill_text("alia-x")),
             skill_manage(action="write_file", name="my-local", file_path="SKILL.md", file_content=_skill_text("alia-x")),
-            # A nested '<dir>/SKILL.md' is a new skill of its own.
-            skill_manage(action="write_file", name="my-local", file_path="alia-nested/SKILL.md",
-                         file_content=_skill_text("nested")),
         ]
         for raw in attempts:
             result = json.loads(raw)
@@ -972,20 +969,18 @@ _CURATE = "  curate_agent_skills: true\n"
 
 
 def _agent_creates() -> list:
-    """A foreground create, flat and batched, and a new nested '<dir>/SKILL.md' from write_file."""
+    """A foreground create, flat and batched."""
     return [
         skill_manage(action="create", name="flat-lesson", content=_skill_text("flat-lesson")),
         skill_manage(action="", name="", operations=[
             {"name": "batch-lesson", "action": "create", "content": _skill_text("batch-lesson")}]),
-        skill_manage(action="write_file", name="my-local", file_path="nested-lesson/SKILL.md",
-                     file_content=_skill_text("nested-lesson")),
     ]
 
 
 def _assert_all_succeed(raws) -> None:
     for raw in raws:
         result = json.loads(raw)
-        assert result["success"] is True and "_new_skill_md" not in result, result
+        assert result["success"] is True, result
 
 
 class TestCurateAgentSkills:
@@ -995,7 +990,7 @@ class TestCurateAgentSkills:
         _assert_all_succeed(_agent_creates() + [
             skill_manage(action="patch", name="flat-lesson", old_string="OLD_MARKER", new_string="NEW"),
             skill_manage(action="edit", name="batch-lesson", content=_skill_text("batch-lesson") + "More.\n")])
-        assert skill_usage.list_agent_created_skill_names() == ["batch-lesson", "flat-lesson", "nested-lesson"]
+        assert skill_usage.list_agent_created_skill_names() == ["batch-lesson", "flat-lesson"]
 
     @pytest.mark.parametrize("extra,lookup_fails", [("", False), ("  curate_agent_skills: false\n", False),
                                                     (_CURATE, True)], ids=["unset", "false", "lookup-fails"])
@@ -1013,41 +1008,71 @@ class TestCurateAgentSkills:
         _assert_all_succeed(_agent_creates())
         usage = skill_usage.load_usage()
         assert usage["flat-lesson"]["created_by"] is None and usage["batch-lesson"]["created_by"] is None
-        assert "nested-lesson" not in usage  # upstream records nothing for a nested skill
         assert skill_usage.list_agent_created_skill_names() == []
 
     def test_on_skills_in_external_dirs_are_never_curator_managed(self, tmp_path, monkeypatch):
         from tools import skill_usage
         home = _cap_home(tmp_path, monkeypatch, create_dir_external=True, extra=_CURATE)  # learned/ is external
         _assert_all_succeed([
-            skill_manage(action="create", name="ext-lesson", content=_skill_text("ext-lesson")),
-            skill_manage(action="write_file", name="alia-gmail", file_path="ext-nested/SKILL.md",
-                         file_content=_skill_text("ext-nested"))])
+            skill_manage(action="create", name="ext-lesson", content=_skill_text("ext-lesson"))])
         assert (home / "skills" / "learned" / "ext-lesson" / "SKILL.md").is_file()
-        assert (home / "cap-skills" / "alia-gmail" / "ext-nested" / "SKILL.md").is_file()
         assert skill_usage.list_agent_created_skill_names() == []
-        assert not any(map(skill_usage.is_curator_managed, ("ext-lesson", "ext-nested", "alia-gmail")))
+        assert not skill_usage.is_curator_managed("ext-lesson")
 
     def test_on_existing_skills_keep_their_records(self, tmp_path, monkeypatch):
-        """Nothing that exists is handed to the curator: the skill written to, a nested skill it
-        overwrites, a skill already answering to the new name, or a record whose skill is off disk."""
+        """Nothing that exists is handed to the curator: the skill written to, or a skill already
+        answering to the new name."""
         from tools import skill_usage
         home = _cap_home(tmp_path, monkeypatch, extra=_CURATE)
-        for rel, fm_name in (("my-local/old-nested", "old-nested"), ("notes-dir", "notes")):
-            (home / "skills" / rel).mkdir()
-            (home / "skills" / rel / "SKILL.md").write_text(_skill_text(fm_name))
+        (home / "skills" / "notes-dir").mkdir()
+        (home / "skills" / "notes-dir" / "SKILL.md").write_text(_skill_text("notes"))
         skill_usage.bump_view("my-local")  # user-owned, with history
-        skill_usage.bump_view("gone")  # archived, or removed by hand
-        nested = [("old-nested", "old-nested"), ("notes-copy", "notes"), ("gone", "gone"),
-                  ("my-local", "my-local")]  # last: '<skill>/SKILL.md' lands as a second, nested 'my-local'
         _assert_all_succeed([
             skill_manage(action="patch", name="my-local", old_string="OLD_MARKER", new_string="NEW"),
-            *(skill_manage(action="write_file", name="my-local", file_path=f"{d}/SKILL.md",
-                           file_content=_skill_text(fm_name)) for d, fm_name in nested),
             skill_manage(action="create", name="notes", content=_skill_text("notes"))])
-        assert (home / "skills" / "my-local" / "my-local" / "SKILL.md").is_file()
         assert skill_usage.list_agent_created_skill_names() == []
-        assert [skill_usage.get_record(n)["view_count"] for n in ("my-local", "gone")] == [1, 1]
+        assert skill_usage.get_record("my-local")["view_count"] == 1
+
+
+class TestWriteFileNestedSkillMd:
+    """file_path is relative to the skill's folder, so write_file '<dir>/SKILL.md' would land one
+    folder deeper as a second skill: 'demo/SKILL.md' on demo makes skill_view('demo') ambiguous, and
+    any other '<dir>' makes a new skill outside skills.create_dir."""
+
+    @pytest.mark.parametrize("sub", ["demo", "notes"])
+    def test_nested_skill_md_is_refused_and_nothing_is_written(self, tmp_path, monkeypatch, sub):
+        from tools.skills_tool import skill_view
+        home = _cap_home(tmp_path, monkeypatch)
+        assert json.loads(skill_manage(action="create", name="demo", content=_skill_text("demo")))["success"]
+        before = _tree(home / "skills")
+        result = json.loads(skill_manage(action="write_file", name="demo", file_path=f"{sub}/SKILL.md",
+                                         file_content=_skill_text(sub)))
+        assert result == {"success": False, "error": (
+            f"Not written: file_path is relative to this skill's folder, so '{sub}/SKILL.md' would create "
+            f"a skill inside it, at learned/demo/{sub}/SKILL.md. To change this skill's main file, use "
+            "file_path 'SKILL.md' or action 'patch'. To make a new skill, use action 'create'.")}
+        assert _tree(home / "skills") == before
+        assert json.loads(skill_view("demo"))["success"] is True
+
+    def test_root_skill_md_still_rewrites_the_main_file(self, tmp_path, monkeypatch):
+        home = _cap_home(tmp_path, monkeypatch)
+        skill_manage(action="create", name="demo", content=_skill_text("demo"))
+        new = _skill_text("demo").replace("OLD_MARKER", "NEW_MARKER")
+        result = json.loads(skill_manage(action="write_file", name="demo", file_path="SKILL.md", file_content=new))
+        assert result["success"] is True, result
+        assert (home / "skills" / "learned" / "demo" / "SKILL.md").read_text() == new
+
+    def test_remove_file_still_deletes_a_nested_duplicate(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+        home = _cap_home(tmp_path, monkeypatch)
+        skill_manage(action="create", name="demo", content=_skill_text("demo"))
+        dup = home / "skills" / "learned" / "demo" / "demo"
+        dup.mkdir()
+        (dup / "SKILL.md").write_text(_skill_text("demo"))  # left by write_file 'demo/SKILL.md' before the refusal
+        result = json.loads(skill_manage(action="remove_file", name="demo", file_path="demo/SKILL.md"))
+        assert result["success"] is True, result
+        assert not dup.exists()
+        assert json.loads(skill_view("demo"))["success"] is True
 
 
 class TestBackgroundOwnershipPolicyConsistency:

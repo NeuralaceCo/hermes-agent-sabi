@@ -1329,7 +1329,7 @@ DEFAULT_CONFIG = {
         # Name prefixes kept for shipped skills (e.g. ["alia-"]): skill_manage refuses a NEW skill
         # name, or a SKILL.md frontmatter name, starting with one (case-insensitive). Existing kept.
         "reserved_name_prefixes": [],
-        # true = a skill the agent creates in a normal turn (create, or a new nested <dir>/SKILL.md)
+        # true = a skill the agent creates in a normal turn (action create, flat or batched)
         # is curator-managed like a background-review create, so the curator can archive it once
         # unused. Never external_dirs; existing records kept. Default: foreground creates are the user's.
         "curate_agent_skills": False,
