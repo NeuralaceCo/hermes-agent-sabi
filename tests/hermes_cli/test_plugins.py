@@ -1265,6 +1265,169 @@ class TestForceReloadSymmetry:
         assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in result
         hold.set()
 
+    @staticmethod
+    def _per_task_policy(hold_task: str, hold: threading.Event, started: threading.Event, calls: list):
+        """pre_tool_call policy that hangs for *hold_task* only and allows everyone else."""
+        def policy(task_id: str = "", **_kwargs):
+            calls.append(task_id)
+            if task_id == hold_task:
+                started.set()
+                hold.wait(timeout=10.0)
+            return None
+        return policy
+
+    def test_pre_tool_call_in_flight_for_one_task_does_not_block_another(self, monkeypatch):
+        """Task B's tool call must not be skipped (fail-closed) while task A's hook is still running."""
+        import time
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0)
+        hold, started, calls = threading.Event(), threading.Event(), []
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [self._per_task_policy("task-a", hold, started, calls)]
+
+        task_a = threading.Thread(
+            target=mgr.invoke_hook, args=("pre_tool_call",), kwargs={"task_id": "task-a"}, daemon=True)
+        task_a.start()
+        assert started.wait(timeout=2.0)
+        try:
+            t0 = time.monotonic()
+            assert mgr.invoke_hook("pre_tool_call", task_id="task-b") == []
+            assert time.monotonic() - t0 < 1.0
+            assert calls == ["task-a", "task-b"]
+        finally:
+            hold.set()
+            task_a.join(timeout=2.0)
+
+    def test_pre_tool_call_timeout_for_one_task_does_not_suppress_another(self, monkeypatch):
+        """Task A's timeout still fails closed within the bound, but task B keeps running its hook."""
+        import time
+
+        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1)
+        hold, started, calls = threading.Event(), threading.Event(), []
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [self._per_task_policy("task-a", hold, started, calls)]
+        block = [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
+        try:
+            t0 = time.monotonic()
+            assert mgr.invoke_hook("pre_tool_call", task_id="task-a") == block
+            assert time.monotonic() - t0 < 2.0
+            # Task A stays suppressed (its worker is abandoned, still running)...
+            assert mgr.invoke_hook("pre_tool_call", task_id="task-a") == block
+            # ...while task B is untouched.
+            assert mgr.invoke_hook("pre_tool_call", task_id="task-b") == []
+            assert calls == ["task-a", "task-b"]
+        finally:
+            hold.set()
+
+    def test_pre_tool_call_falls_back_to_session_id_scope(self, monkeypatch):
+        """Callers that pass only session_id are still scoped per session."""
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1)
+        hold, calls = threading.Event(), []
+
+        def policy(session_id: str = "", **_kwargs):
+            calls.append(session_id)
+            if session_id == "s-a":
+                hold.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [policy]
+        try:
+            assert mgr.invoke_hook("pre_tool_call", session_id="s-a") != []
+            assert mgr.invoke_hook("pre_tool_call", session_id="s-b") == []
+            assert calls == ["s-a", "s-b"]
+        finally:
+            hold.set()
+
+    def test_pre_tool_call_same_task_overlap_still_skipped(self, monkeypatch):
+        """Within one task the callback never runs twice at once: an overlapping call fails closed."""
+        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0)
+        hold, started, calls = threading.Event(), threading.Event(), []
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [self._per_task_policy("task-a", hold, started, calls)]
+
+        first = threading.Thread(
+            target=mgr.invoke_hook, args=("pre_tool_call",), kwargs={"task_id": "task-a"}, daemon=True)
+        first.start()
+        assert started.wait(timeout=2.0)
+        try:
+            assert mgr.invoke_hook("pre_tool_call", task_id="task-a") == [
+                {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
+            assert calls == ["task-a"]
+        finally:
+            hold.set()
+            first.join(timeout=2.0)
+        # Once the first call finishes, the same task runs its hook again.
+        assert mgr.invoke_hook("pre_tool_call", task_id="task-a") == []
+        assert calls == ["task-a", "task-a"]
+
+    def test_per_task_hook_state_does_not_accumulate(self, monkeypatch):
+        """Finished tasks leave no running entry; expired suppression entries are pruned."""
+        import time
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.05)
+        hold = threading.Event()
+
+        def policy(task_id: str = "", **_kwargs):
+            if task_id.startswith("slow-"):
+                hold.wait(timeout=10.0)
+            return None
+
+        import hermes_cli.plugins_dispatch as dispatch_mod
+
+        mgr = PluginManager()
+        mgr._hook_timeout_suppression_seconds = 60.0
+        mgr._hooks["pre_tool_call"] = [policy]
+        try:
+            for i in range(50):
+                assert mgr.invoke_hook("pre_tool_call", task_id=f"fast-{i}") == []
+            assert mgr._hook_running_callbacks == {}
+            assert mgr._hook_timeout_suppressed_until == {}
+
+            for i in range(5):
+                mgr.invoke_hook("pre_tool_call", task_id=f"slow-{i}")
+            assert len(mgr._hook_timeout_suppressed_until) == 5
+            # Jump past every suppression window above, then time out one more task.
+            later = time.monotonic() + 120.0
+            monkeypatch.setattr(dispatch_mod, "time", types.SimpleNamespace(monotonic=lambda: later))
+            mgr.invoke_hook("pre_tool_call", task_id="slow-last")
+            monkeypatch.setattr(dispatch_mod, "time", time)
+            assert [key[2] for key in mgr._hook_timeout_suppressed_until] == ["slow-last"]
+        finally:
+            hold.set()
+        deadline = time.monotonic() + 2.0
+        while mgr._hook_running_callbacks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert mgr._hook_running_callbacks == {}
+
+    def test_hook_hung_in_every_task_has_bounded_workers(self, monkeypatch):
+        """A callback that hangs for every task cannot leak one worker per task: past the
+        per-callback budget, new tasks fail closed without starting a thread."""
+        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.01)
+        hold, starts = threading.Event(), []
+
+        def hung(task_id: str = "", **_kwargs):
+            starts.append(task_id)
+            hold.wait(timeout=10.0)
+
+        mgr = PluginManager()
+        mgr._hook_max_running_per_callback = 3
+        mgr._hooks["pre_tool_call"] = [hung]
+        block = [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
+        try:
+            for i in range(10):
+                assert mgr.invoke_hook("pre_tool_call", task_id=f"task-{i}") == block
+            assert starts == ["task-0", "task-1", "task-2"]
+            assert len(mgr._hook_running_callbacks) == 3
+        finally:
+            hold.set()
+
     def test_force_reload_of_one_profile_does_not_orphan_another(self, monkeypatch):
         """Real two-manager regression: force-reloading profile A's plugin
         manager must leave profile B's shell hook registered exactly once —

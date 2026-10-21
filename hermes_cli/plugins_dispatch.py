@@ -50,6 +50,8 @@ _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
+# In-flight workers per callback across all task scopes; caps threads a callback hung in every task can strand.
+_HOOK_MAX_RUNNING_PER_CALLBACK = 32
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
 # System-prompt sections are tightly bounded: they become high-trust prompt bytes charged every turn.
@@ -203,9 +205,14 @@ class PluginDispatchMixin:
     ) -> Any:
         """Run one callback on a daemon worker with a wall-clock cap; ``_HOOK_SKIPPED`` when
         suppressed, still running, timed out (worker abandoned, never joined), or the worker
-        could not be started. Exceptions propagate."""
+        could not be started. Exceptions propagate.
+
+        Running/suppressed state is scoped per task (``task_id``, else ``session_id``), so one
+        task's slow or hung callback never skips another task's call. Calls with neither id share
+        one scope."""
         callback_name = getattr(cb, "__name__", repr(cb))
-        callback_key = (hook_name, id(cb))
+        scope = str(kwargs.get("task_id") or kwargs.get("session_id") or "")
+        callback_key = (hook_name, id(cb), scope)
         token = object()
         with self._hook_timeout_lock:
             suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
@@ -214,6 +221,12 @@ class PluginDispatchMixin:
                 logger.warning(
                     "Hook '%s' callback %s skipped after previous "
                     "timeout or while still running", hook_name, callback_name)
+                return _HOOK_SKIPPED
+            in_flight = sum(1 for key in self._hook_running_callbacks if key[:2] == callback_key[:2])
+            if in_flight >= self._hook_max_running_per_callback:
+                logger.warning(
+                    "Hook '%s' callback %s skipped: %d workers already in flight across tasks",
+                    hook_name, callback_name, in_flight)
                 return _HOOK_SKIPPED
             if suppressed_until is not None:
                 self._hook_timeout_suppressed_until.pop(callback_key, None)
@@ -249,9 +262,13 @@ class PluginDispatchMixin:
             return _HOOK_SKIPPED
         if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
             with self._hook_timeout_lock:
-                # See #6622.
+                # See #6622. Per-task keys would otherwise pile up for tasks that never fire again.
+                now = time.monotonic()
+                expired = [k for k, until in self._hook_timeout_suppressed_until.items() if until <= now]
+                for key in expired:
+                    del self._hook_timeout_suppressed_until[key]
                 self._hook_timeout_suppressed_until[callback_key] = (
-                    time.monotonic() + self._hook_timeout_suppression_seconds)
+                    now + self._hook_timeout_suppression_seconds)
             logger.warning(
                 "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
             return _HOOK_SKIPPED

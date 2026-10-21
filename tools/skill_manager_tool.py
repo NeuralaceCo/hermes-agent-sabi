@@ -29,8 +29,9 @@ from agent.skill_utils import (
     SKILL_PROMPT_DESC_LIMIT)
 from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
-    _containing_skills_root, _curator_consolidation_delete_guard, _maybe_auto_propose_org_edit,
-    _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
+    _containing_skills_root, _curator_consolidation_delete_guard, _external_read_only_guard,
+    _maybe_auto_propose_org_edit, _org_mirror_write_guard, _pinned_guard, _reserved_name_guard,
+    _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import _skill_manage_batch
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
@@ -170,6 +171,10 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
             f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
             f"or templates/.")
     return None
+
+
+def _frontmatter_name(content: Optional[str]) -> Any:
+    return _parse_frontmatter(content or "")[0].get("name")
 
 
 def _description_preview(content: str) -> str:
@@ -319,13 +324,14 @@ def _resolve_supporting_file(skill_dir: Path, file_path: str):
 
 def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
                       org_guard: bool = True):
-    """Find the skill; run the org-mirror (unless ``org_guard=False``) and background-review
-    write guards -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
+    """Find the skill; run the org-mirror (unless ``org_guard=False``), external read-only and
+    background-review write guards -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
     existing = _find_skill(name)
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
     guard = ((org_guard and _org_mirror_write_guard(name, skill_dir, action))
+             or _external_read_only_guard(name, skill_dir, action)
              or _background_review_write_guard(name, skill_dir, action))
     return (None, guard) if guard else (skill_dir, None)
 
@@ -339,6 +345,11 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8")
+    # Any SKILL.md write can rename a skill through its frontmatter.
+    if target.name == "SKILL.md" and (reserved := _reserved_name_guard(
+            target.parent.name, _frontmatter_name(content),
+            keep=() if original is None else (target.parent.name, _frontmatter_name(original)))):
+        return reserved
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
     scan_error = _security_scan_skill(skill_dir)
@@ -390,6 +401,9 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 # --- Core actions -------------------------------------------------------------
 
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+    # Checked before name validation, so 'ALIA-x' is told the prefix is reserved, not only to use lowercase.
+    if reserved := _reserved_name_guard(name, _frontmatter_name(content)):
+        return reserved
     if err := (_validate_name(name) or _validate_category(category)
                or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
         return _err(err)
@@ -539,6 +553,14 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if guard:
         return guard
     target, err = _resolve_supporting_file(skill_dir, file_path)
+    # sabi: discovery indexes a nested '<dir>/SKILL.md' as another skill, one that bypasses create; a
+    # same-name one makes skill_view ambiguous. Not in _validate_file_path, so remove_file can delete one.
+    if not err and target.name == "SKILL.md" and target.parent != skill_dir:
+        root = _skills_dir()  # the display form create uses for "path"
+        shown = target.relative_to(root) if target.is_relative_to(root) else target
+        return _err(f"Not written: file_path is relative to this skill's folder, so '{file_path}' would create "
+                    f"a skill inside it, at {shown}. To change this skill's main file, use file_path 'SKILL.md' "
+                    "or action 'patch'. To make a new skill, use action 'create'.")
     if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
         return guard
     result = _attach_org_note({"success": True, "message": f"File '{file_path}' written to skill '{name}'.",
@@ -692,6 +714,25 @@ _REQUIRED_ARGS = {
     "remove_file": [("file_path", _MISSING, "file_path is required for 'remove_file'.")]}
 
 
+def _agent_skill_to_curate(skill_md, name: str) -> Optional[str]:
+    """sabi: ``skills.curate_agent_skills`` (default off) records a skill the agent brings into being
+    in a normal turn as curator-managed, like a background-review create, so the curator marks it
+    stale and archives it once unused. Returns the name to record it under, or None: setting off or
+    unreadable, skill in an external dir, or another skill already answers to the name (the record
+    would hand that one to the curator too)."""
+    try:
+        from agent.skill_utils import _skills_cfg_get, get_all_skills_dirs, is_external_skill_path
+        from tools.skills_tool import _collect_skill_candidates
+        if not is_truthy_value(_skills_cfg_get("curate_agent_skills")) or is_external_skill_path(skill_md):
+            return None
+        skill_md = Path(skill_md)
+        found = {md.resolve() for _, md in _collect_skill_candidates(name, None, get_all_skills_dirs())}
+        return name if found == {skill_md.resolve()} else None
+    except Exception:
+        logger.debug("skills.curate_agent_skills lookup failed for %s", skill_md, exc_info=True)
+        return None
+
+
 def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
                     session_id, ledger_before) -> None:
     """Best-effort post-mutation side effects (never break the tool): ledger, prompt-cache
@@ -710,8 +751,9 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
     # Curator telemetry: only the background review fork marks a skill agent-created
-    # (foreground creates belong to the user). A recoverable curator archive keeps its
-    # record as STATE_ARCHIVED (`hermes curator status`/`restore`); only a hard delete forgets.
+    # (foreground creates belong to the user), unless skills.curate_agent_skills (sabi). A recoverable
+    # curator archive keeps its record as STATE_ARCHIVED (`hermes curator status`/`restore`); only a
+    # hard delete forgets.
     with suppress(Exception):
         from tools.skill_usage import bump_patch, forget, record_created
         # During the curator consolidation pass, a verified consolidation must be RECOVERABLE: archival into
@@ -721,8 +763,8 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         # Foreground, user-directed deletes keep their existing hard-delete semantics.
         from tools.skill_provenance import is_background_review
         if action == "create":
-            record_created(name, agent_created=is_background_review(),
-                           task_id=task_id, session_id=session_id)
+            record_created(name, agent_created=is_background_review() or bool(
+                _agent_skill_to_curate(result["skill_md"], name)), task_id=task_id, session_id=session_id)
         elif action in {"patch", "edit", "write_file", "remove_file"}:
             bump_patch(name, action=action, task_id=task_id, session_id=session_id)
         elif action == "delete" and not result.get("_archived"):

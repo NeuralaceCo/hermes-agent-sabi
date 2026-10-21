@@ -1323,6 +1323,16 @@ DEFAULT_CONFIG = {
     # and resolved; read-only — creation goes to ~/.hermes/skills/ unless create_dir redirects it.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # true = skill_manage refuses every write (foreground too) to skills under external_dirs, for
+        # hosts that re-copy them on each start. create_dir stays writable. Default: edit in place.
+        "external_read_only": False,
+        # Name prefixes kept for shipped skills (e.g. ["alia-"]): skill_manage refuses a NEW skill
+        # name, or a SKILL.md frontmatter name, starting with one (case-insensitive). Existing kept.
+        "reserved_name_prefixes": [],
+        # true = a skill the agent creates in a normal turn (action create, flat or batched)
+        # is curator-managed like a background-review create, so the curator can archive it once
+        # unused. Never external_dirs; existing records kept. Default: foreground creates are the user's.
+        "curate_agent_skills": False,
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
         # HERMES_HOME, scanned alongside the local dir.

@@ -394,6 +394,49 @@ class TestBuildSkillsSystemPrompt:
         second = build_skills_system_prompt()
         assert "cached-skill" not in second
 
+    def test_skills_index_counts_entries_by_source(self, monkeypatch, tmp_path):
+        """sabi: counts go by the dir an entry came from, never its name: an agent-made alia-* skill
+        is local, create_dir entries are not external, and a shipped skill shadowed by a local one
+        is not on the menu at all."""
+        from agent.prompt_builder import clear_skills_system_prompt_cache, skills_index_counts
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        for root, name in ((home / "skills", "alia-mine"), (home / "skills", "shared"),
+                           (tmp_path / "learned", "lesson"), (tmp_path / "cap-skills", "alia-gmail"),
+                           (tmp_path / "cap-skills", "alia-slack"), (tmp_path / "cap-skills", "shared")):
+            (root / name).mkdir(parents=True)
+            (root / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name} skill.\n---\nBody.\n")
+        (home / "config.yaml").write_text(
+            f"skills:\n  create_dir: {tmp_path / 'learned'}\n  external_dirs:\n    - {tmp_path / 'cap-skills'}\n")
+
+        menu = build_skills_system_prompt()
+        assert skills_index_counts(f"You are Hermes.\n\n{menu}\n\nConversation started: now") == (5, 2)
+        assert skills_index_counts("You are Hermes.") is None
+        # A continuing session keeps sending the menu it started with, after any cache clear.
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        assert skills_index_counts(menu) == (5, 2)
+
+    def test_preamble_saves_lessons_silently_and_routes_read_only_fixes(self, monkeypatch, tmp_path):
+        """sabi: the menu has the model save lessons itself without asking the user, and put a fix
+        for a read-only (shipped) skill into a new skill of its own."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "skills" / "probe").mkdir(parents=True)
+        (tmp_path / "skills" / "probe" / "SKILL.md").write_text("---\nname: probe\ndescription: Probe.\n---\nBody.\n")
+        menu = build_skills_system_prompt()
+        assert "offer to save" not in menu
+        assert "Do it silently: never ask the user whether to save it." in menu
+        assert "if it is read-only, save the fix as a new skill of your own instead." in menu
+
+    def test_preamble_keeps_copied_text_and_personal_facts_out_of_skills(self, monkeypatch, tmp_path):
+        """sabi: a skill reaches every later prompt that loads it and cannot forget, so it holds
+        how-to steps only: no text pasted from emails, web pages or files, no facts about the user."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "skills" / "probe").mkdir(parents=True)
+        (tmp_path / "skills" / "probe" / "SKILL.md").write_text("---\nname: probe\ndescription: Probe.\n---\nBody.\n")
+        menu = build_skills_system_prompt()
+        assert "Never copy text from emails, web pages or files into a skill." in menu
+        assert "Keep personal facts about the user out of skills; skills hold how-to steps." in menu
+
 
 # =========================================================================
 # Context files prompt builder

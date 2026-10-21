@@ -382,18 +382,34 @@ def _coerce_request_messages(*, request_messages: Any = None, messages: Any = No
     return [] if user_message is None else [{"role": "user", "content": user_message}]
 
 
+def _system_prompt_text(system_prompt: Any) -> str:
+    """Plain text of an Anthropic/Bedrock ``system`` param or OpenAI-style system content."""
+    if isinstance(system_prompt, str):
+        return system_prompt.strip()
+    if not isinstance(system_prompt, list):
+        return ""
+    # Anthropic: {"type": "text", "text": ...}; Bedrock Converse: {"text": ...}; or bare strings.
+    blocks = ((b.get("text", "") if b.get("type") in ("text", None) and "text" in b else None)
+              if isinstance(b, dict) else b for b in system_prompt)
+    return "\n\n".join(b for b in blocks if isinstance(b, str) and b)
+
+
 def _serialize_system_prompt(system_prompt: Any) -> Optional[dict[str, Any]]:
     """Normalize Anthropic/Bedrock ``system`` param or OpenAI-style system content."""
-    if isinstance(system_prompt, str):
-        text = system_prompt.strip()
-    elif isinstance(system_prompt, list):
-        # Anthropic: {"type": "text", "text": ...}; Bedrock Converse: {"text": ...}; or bare strings.
-        blocks = ((b.get("text", "") if b.get("type") in ("text", None) and "text" in b else None)
-                  if isinstance(b, dict) else b for b in system_prompt)
-        text = "\n\n".join(b for b in blocks if isinstance(b, str) and b)
-    else:
-        return None
+    text = _system_prompt_text(system_prompt)
     return {"role": "system", "content": _capture_content(text)} if text else None
+
+
+def _skills_index_metadata(system_prompt: Any) -> Dict[str, int]:
+    """sabi: entries on the request's skills menu, all and from ``skills.external_dirs``. The logged
+    system prompt is cut before the menu, so this is the only record of what it listed. Looked up
+    from the prompt builder, never computed here; {} when unknown or on any error."""
+    with _failsafe("skills index counts"):
+        from agent.prompt_builder import skills_index_counts
+        counts = skills_index_counts(_system_prompt_text(system_prompt))
+        if counts:
+            return {"skills_index.total": counts[0], "skills_index.external": counts[1]}
+    return {}
 
 
 def _messages_for_langfuse_input(*, request_messages: Any = None, messages: Any = None,
@@ -780,6 +796,7 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
     langfuse_input = _messages_for_langfuse_input(request_messages=input_messages, system_prompt=system_prompt)
     has_system = bool(langfuse_input) and langfuse_input[0].get("role") == "system"
     system_chars = len(str(langfuse_input[0].get("content") or "")) if has_system else 0
+    skills_index = _skills_index_metadata(system_prompt)
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
@@ -793,6 +810,7 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
             "provider": provider, "platform": platform, "api_mode": api_mode, "base_url": base_url,
             "message_count": message_count, "approx_input_tokens": approx_input_tokens,
             **({"system_prompt_chars": system_chars} if system_chars else {}),
+            **skills_index,
         }
         state.generations[req_key] = _start_child_observation(
             state, name=f"LLM call {api_call_count}", as_type="generation",

@@ -161,6 +161,50 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
+def _external_read_only_guard(name: str, skill_dir: Path, action: str) -> Optional[Dict[str, Any]]:
+    """sabi: ``skills.external_read_only`` (default off) refuses EVERY write, foreground too, to a
+    skill under ``skills.external_dirs`` (``skills.create_dir`` stays writable). A host that re-copies
+    those dirs on each start loses the edit, and until then skill_view serves a copy that differs from
+    the shipped file. Opt-in because upstream dropped an unconditional gate (#4759/#4381): agents
+    copied whole skills instead, so the refusal steers to saving only the lesson. Fails open: the
+    worst case is an edit the next restart wipes."""
+    try:
+        from agent.skill_utils import _skills_cfg_get, get_skill_create_dir, is_external_skill_path
+        from utils import is_truthy_value
+        if not (is_truthy_value(_skills_cfg_get("external_read_only")) and is_external_skill_path(skill_dir)):
+            return None
+        create_dir = get_skill_create_dir()
+        if create_dir is not None and skill_dir.resolve().is_relative_to(create_dir):
+            return None
+    except Exception:
+        logger.debug("external read-only guard lookup failed for %s", name, exc_info=True)
+        return None
+    return _refusal(
+        f"'{name}' is a shipped skill and is read-only, so {action} is not allowed. Keep following it "
+        f"as written. To save what you learned, create a new, short skill of your own named for the "
+        f"task, holding only the new lesson. Do not copy this skill or reuse its name or prefix.")
+
+
+def _reserved_name_guard(*names: Any, keep: tuple = ()) -> Optional[Dict[str, Any]]:
+    """sabi: ``skills.reserved_name_prefixes`` (default none) refuses a NEW skill name that starts
+    with a prefix reserved for shipped skills, ignoring case. skill_view and the menu also answer to
+    a SKILL.md's frontmatter ``name:``, so callers pass that too. *keep* holds the names the target
+    already has, which stay as they are. Fails open when the config cannot be read."""
+    try:
+        from agent.skill_utils import _skills_cfg_get, parse_config_string_list
+        prefixes = [p.strip() for p in parse_config_string_list(_skills_cfg_get("reserved_name_prefixes")) if p.strip()]
+    except Exception:
+        logger.debug("reserved name prefix lookup failed", exc_info=True)
+        return None
+    kept = {str(k).lower() for k in keep if k}
+    for name in (str(n) for n in names if n):
+        prefix = next((p for p in prefixes if name.lower().startswith(p.lower())), None)
+        if prefix and name.lower() not in kept:
+            return _refusal(f"'{name}' starts with '{prefix}', which is reserved for skills shipped with "
+                            f"the app. Choose another name for your own skill.")
+    return None
+
+
 def _background_review_write_guard(
     name: str, skill_dir: Path, action: str) -> Optional[Dict[str, Any]]:
     """Refuse autonomous curator writes to anything but curator-owned sediment. The review fork

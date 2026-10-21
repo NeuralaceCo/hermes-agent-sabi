@@ -823,6 +823,258 @@ class TestExternalSkillMutations:
             tmp_path / "manual-skill" / "SKILL.md"
         ).read_text(encoding="utf-8")
 
+
+# ---------------------------------------------------------------------------
+# skills.external_read_only (sabi): shipped external-dir skills are read-only
+# ---------------------------------------------------------------------------
+
+READ_ONLY = "is a shipped skill and is read-only"
+_SHIPPED_WRITES = {
+    "patch": {"action": "patch", "old_string": "OLD_MARKER", "new_string": "NEW"},
+    "patch-rewrite": {"action": "patch", "content": VALID_SKILL_CONTENT_2},
+    "edit": {"action": "edit", "content": VALID_SKILL_CONTENT_2},
+    "write_file": {"action": "write_file", "file_path": "references/new.md", "file_content": "x"},
+    "remove_file": {"action": "remove_file", "file_path": "references/slugs.md"},
+    "delete": {"action": "delete"},
+}
+
+
+def _cap_home(tmp_path, monkeypatch, *, read_only=None, create_dir_external=False, extra="") -> Path:
+    """cap-ts's sandbox layout on a real HERMES_HOME: local skills/ with create_dir skills/learned
+    inside it, shipped skills in cap-skills/ listed in skills.external_dirs. *extra* = more skills: lines."""
+    home = tmp_path / ".hermes"
+    learned = home / "skills" / "learned"
+    learned.mkdir(parents=True)
+    _write_external_skill(home / "skills", "my-local")
+    shipped = _write_external_skill(home / "cap-skills", "alia-gmail")
+    (shipped / "references").mkdir()
+    (shipped / "references" / "slugs.md").write_text("SLUGS\n")
+    externals = [home / "cap-skills", *([learned] if create_dir_external else [])]
+    (home / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n" + "".join(f"    - {d}\n" for d in externals)
+        + "  create_dir: skills/learned\n"
+        + ("" if read_only is None else f"  external_read_only: {read_only}\n") + extra)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    import tools.skill_manager_tool as smt
+    from agent import skill_utils as su
+    monkeypatch.setattr(hermes_constants, "_hermes_home_cache", None, raising=False)
+    monkeypatch.setattr(smt, "SKILLS_DIR", home / "skills")
+    su._external_dirs_cache_clear()
+    return home
+
+
+def _tree(root: Path) -> dict:
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+class TestExternalReadOnly:
+    @pytest.mark.parametrize("op", sorted(_SHIPPED_WRITES))
+    def test_flag_on_refuses_every_write_to_a_shipped_skill(self, tmp_path, monkeypatch, op):
+        home = _cap_home(tmp_path, monkeypatch, read_only="true")
+        before = {d: _tree(home / d) for d in ("cap-skills", "skills/my-local")}
+        results = [json.loads(skill_manage(name="alia-gmail", **_SHIPPED_WRITES[op]))]
+        if op != "edit":  # legacy flat-only alias: the batch shape has no edit op
+            ops = [{"name": "alia-gmail", **_SHIPPED_WRITES[op]}]
+            if op != "delete":  # delete must be the sole op; others ride behind a local write that rolls back
+                ops.insert(0, {"name": "my-local", "action": "patch", "old_string": "OLD_MARKER", "new_string": "NEW"})
+            results.append(json.loads(skill_manage(action="", name="", operations=ops)))
+        for result in results:
+            assert result["success"] is False and READ_ONLY in result["error"], result
+        assert {d: _tree(home / d) for d in before} == before
+
+    @pytest.mark.parametrize("create_dir_external", [False, True])
+    def test_flag_on_keeps_local_and_create_dir_skills_writable(self, tmp_path, monkeypatch, create_dir_external):
+        home = _cap_home(tmp_path, monkeypatch, read_only="true", create_dir_external=create_dir_external)
+        created = json.loads(skill_manage(action="create", name="my-lesson", content=VALID_SKILL_CONTENT))
+        assert created["success"] is True, created
+        assert (home / "skills" / "learned" / "my-lesson" / "SKILL.md").is_file()
+        for name, old in (("my-lesson", "Do the thing."), ("my-local", "OLD_MARKER")):
+            patched = json.loads(skill_manage(action="patch", name=name, old_string=old, new_string="NEW"))
+            assert patched["success"] is True, patched
+
+    @pytest.mark.parametrize("read_only,lookup_fails", [(None, False), ("false", False), ("true", True)],
+                             ids=["unset", "false", "lookup-fails-open"])
+    def test_flag_off_or_unreadable_patches_shipped_skill_in_place(
+            self, tmp_path, monkeypatch, read_only, lookup_fails):
+        home = _cap_home(tmp_path, monkeypatch, read_only=read_only)
+        if lookup_fails:
+            def _boom(_path):
+                raise OSError("unreadable")
+            monkeypatch.setattr("agent.skill_utils.is_external_skill_path", _boom)
+        result = json.loads(skill_manage(
+            action="patch", name="alia-gmail", old_string="OLD_MARKER", new_string="NEW_MARKER"))
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (home / "cap-skills" / "alia-gmail" / "SKILL.md").read_text()
+        assert not (home / "skills" / "alia-gmail").exists()
+
+
+RESERVED = "which is reserved for skills shipped with the app"
+_RESERVE_ALIA = '  reserved_name_prefixes: ["alia-"]\n'
+
+
+def _skill_text(name: str) -> str:
+    return f"---\nname: {name}\ndescription: Use when testing reserved names.\n---\n\nBody OLD_MARKER.\n"
+
+
+class TestReservedNamePrefixes:
+    @pytest.mark.parametrize("name,fm_name,reserved", [
+        ("alia-foo", "alia-foo", True),
+        ("ALIA-foo", "ALIA-foo", True),
+        ("foo-notes", "Alia-foo", True),  # the menu and skill_view also answer to the frontmatter name
+        ("aliafoo", "aliafoo", False),
+        ("my-alia-notes", "my-alia-notes", False),
+    ])
+    def test_set_create_refuses_reserved_names_in_any_case(self, tmp_path, monkeypatch, name, fm_name, reserved):
+        home = _cap_home(tmp_path, monkeypatch, extra=_RESERVE_ALIA)
+        result = json.loads(skill_manage(action="create", name=name, content=_skill_text(fm_name)))
+        assert result["success"] is not reserved, result
+        assert (RESERVED in result.get("error", "")) is reserved
+        assert (home / "skills" / "learned" / name).exists() is not reserved
+
+    def test_unset_create_allows_the_prefix(self, tmp_path, monkeypatch):
+        home = _cap_home(tmp_path, monkeypatch)
+        result = json.loads(skill_manage(action="create", name="alia-foo", content=_skill_text("alia-foo")))
+        assert result["success"] is True, result
+        assert (home / "skills" / "learned" / "alia-foo" / "SKILL.md").is_file()
+
+    def test_set_covers_batch_curator_and_rename_paths_but_keeps_existing_names(self, tmp_path, monkeypatch):
+        from tools.skill_provenance import BACKGROUND_REVIEW, reset_current_write_origin, set_current_write_origin
+        home = _cap_home(tmp_path, monkeypatch, extra=_RESERVE_ALIA)
+        _write_external_skill(home / "skills" / "learned", "alia-mine")  # agent-made before the reservation
+        before = {d: _tree(home / "skills" / d) for d in ("my-local", "learned")}
+        token = set_current_write_origin(BACKGROUND_REVIEW)  # the curator's consolidation fork
+        try:
+            curator_create = skill_manage(action="create", name="alia-umbrella", content=_skill_text("alia-umbrella"))
+        finally:
+            reset_current_write_origin(token)
+        attempts = [
+            curator_create,
+            skill_manage(action="", name="", operations=[
+                {"name": "alia-bar", "action": "create", "content": _skill_text("alia-bar")}]),
+            # Renaming a skill through its frontmatter, by patch, rewrite or write_file.
+            skill_manage(action="patch", name="my-local", old_string="name: my-local", new_string="name: alia-x"),
+            skill_manage(action="edit", name="my-local", content=_skill_text("alia-x")),
+            skill_manage(action="write_file", name="my-local", file_path="SKILL.md", file_content=_skill_text("alia-x")),
+        ]
+        for raw in attempts:
+            result = json.loads(raw)
+            assert result["success"] is False and RESERVED in result["error"], result
+        assert {d: _tree(home / "skills" / d) for d in before} == before
+        kept = json.loads(skill_manage(action="patch", name="alia-mine", old_string="OLD_MARKER", new_string="NEW"))
+        assert kept["success"] is True, kept
+
+
+_CURATE = "  curate_agent_skills: true\n"
+
+
+def _agent_creates() -> list:
+    """A foreground create, flat and batched."""
+    return [
+        skill_manage(action="create", name="flat-lesson", content=_skill_text("flat-lesson")),
+        skill_manage(action="", name="", operations=[
+            {"name": "batch-lesson", "action": "create", "content": _skill_text("batch-lesson")}]),
+    ]
+
+
+def _assert_all_succeed(raws) -> None:
+    for raw in raws:
+        result = json.loads(raw)
+        assert result["success"] is True, result
+
+
+class TestCurateAgentSkills:
+    def test_on_foreground_creates_are_curator_managed_and_stay_so(self, tmp_path, monkeypatch):
+        from tools import skill_usage
+        _cap_home(tmp_path, monkeypatch, extra=_CURATE)
+        _assert_all_succeed(_agent_creates() + [
+            skill_manage(action="patch", name="flat-lesson", old_string="OLD_MARKER", new_string="NEW"),
+            skill_manage(action="edit", name="batch-lesson", content=_skill_text("batch-lesson") + "More.\n")])
+        assert skill_usage.list_agent_created_skill_names() == ["batch-lesson", "flat-lesson"]
+
+    @pytest.mark.parametrize("extra,lookup_fails", [("", False), ("  curate_agent_skills: false\n", False),
+                                                    (_CURATE, True)], ids=["unset", "false", "lookup-fails"])
+    def test_off_or_unreadable_foreground_creates_stay_user_owned(self, tmp_path, monkeypatch, extra, lookup_fails):
+        from agent import skill_utils as su
+        from tools import skill_usage
+        _cap_home(tmp_path, monkeypatch, extra=extra)
+        if lookup_fails:
+            real = su._skills_cfg_get
+            def _cfg(key):
+                if key == "curate_agent_skills":
+                    raise OSError("unreadable")
+                return real(key)
+            monkeypatch.setattr(su, "_skills_cfg_get", _cfg)
+        _assert_all_succeed(_agent_creates())
+        usage = skill_usage.load_usage()
+        assert usage["flat-lesson"]["created_by"] is None and usage["batch-lesson"]["created_by"] is None
+        assert skill_usage.list_agent_created_skill_names() == []
+
+    def test_on_skills_in_external_dirs_are_never_curator_managed(self, tmp_path, monkeypatch):
+        from tools import skill_usage
+        home = _cap_home(tmp_path, monkeypatch, create_dir_external=True, extra=_CURATE)  # learned/ is external
+        _assert_all_succeed([
+            skill_manage(action="create", name="ext-lesson", content=_skill_text("ext-lesson"))])
+        assert (home / "skills" / "learned" / "ext-lesson" / "SKILL.md").is_file()
+        assert skill_usage.list_agent_created_skill_names() == []
+        assert not skill_usage.is_curator_managed("ext-lesson")
+
+    def test_on_existing_skills_keep_their_records(self, tmp_path, monkeypatch):
+        """Nothing that exists is handed to the curator: the skill written to, or a skill already
+        answering to the new name."""
+        from tools import skill_usage
+        home = _cap_home(tmp_path, monkeypatch, extra=_CURATE)
+        (home / "skills" / "notes-dir").mkdir()
+        (home / "skills" / "notes-dir" / "SKILL.md").write_text(_skill_text("notes"))
+        skill_usage.bump_view("my-local")  # user-owned, with history
+        _assert_all_succeed([
+            skill_manage(action="patch", name="my-local", old_string="OLD_MARKER", new_string="NEW"),
+            skill_manage(action="create", name="notes", content=_skill_text("notes"))])
+        assert skill_usage.list_agent_created_skill_names() == []
+        assert skill_usage.get_record("my-local")["view_count"] == 1
+
+
+class TestWriteFileNestedSkillMd:
+    """file_path is relative to the skill's folder, so write_file '<dir>/SKILL.md' would land one
+    folder deeper as a second skill: 'demo/SKILL.md' on demo makes skill_view('demo') ambiguous, and
+    any other '<dir>' makes a new skill outside skills.create_dir."""
+
+    @pytest.mark.parametrize("sub", ["demo", "notes"])
+    def test_nested_skill_md_is_refused_and_nothing_is_written(self, tmp_path, monkeypatch, sub):
+        from tools.skills_tool import skill_view
+        home = _cap_home(tmp_path, monkeypatch)
+        assert json.loads(skill_manage(action="create", name="demo", content=_skill_text("demo")))["success"]
+        before = _tree(home / "skills")
+        result = json.loads(skill_manage(action="write_file", name="demo", file_path=f"{sub}/SKILL.md",
+                                         file_content=_skill_text(sub)))
+        assert result == {"success": False, "error": (
+            f"Not written: file_path is relative to this skill's folder, so '{sub}/SKILL.md' would create "
+            f"a skill inside it, at learned/demo/{sub}/SKILL.md. To change this skill's main file, use "
+            "file_path 'SKILL.md' or action 'patch'. To make a new skill, use action 'create'.")}
+        assert _tree(home / "skills") == before
+        assert json.loads(skill_view("demo"))["success"] is True
+
+    def test_root_skill_md_still_rewrites_the_main_file(self, tmp_path, monkeypatch):
+        home = _cap_home(tmp_path, monkeypatch)
+        skill_manage(action="create", name="demo", content=_skill_text("demo"))
+        new = _skill_text("demo").replace("OLD_MARKER", "NEW_MARKER")
+        result = json.loads(skill_manage(action="write_file", name="demo", file_path="SKILL.md", file_content=new))
+        assert result["success"] is True, result
+        assert (home / "skills" / "learned" / "demo" / "SKILL.md").read_text() == new
+
+    def test_remove_file_still_deletes_a_nested_duplicate(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+        home = _cap_home(tmp_path, monkeypatch)
+        skill_manage(action="create", name="demo", content=_skill_text("demo"))
+        dup = home / "skills" / "learned" / "demo" / "demo"
+        dup.mkdir()
+        (dup / "SKILL.md").write_text(_skill_text("demo"))  # left by write_file 'demo/SKILL.md' before the refusal
+        result = json.loads(skill_manage(action="remove_file", name="demo", file_path="demo/SKILL.md"))
+        assert result["success"] is True, result
+        assert not dup.exists()
+        assert json.loads(skill_view("demo"))["success"] is True
+
+
 class TestBackgroundOwnershipPolicyConsistency:
     """The autonomous write policy must not depend on its own side effects.
 

@@ -133,6 +133,20 @@ _cached_command_timeout: Optional[int] = None
 _command_timeout_resolved = False
 _cached_snapshot_threshold: Optional[int] = None
 _snapshot_threshold_resolved = False
+_cached_navigate_wait_until: Optional[str] = None
+_navigate_wait_until_resolved = False
+_cached_navigate_settle_ms: Optional[int] = None
+_navigate_settle_ms_resolved = False
+
+# What browser_navigate waits for before it returns. agent-browser's ``open`` always waits
+# for the full ``load`` event (images, fonts, ads); the snapshot the model reads only needs
+# the DOM. ``load`` keeps the CLI path; the others go to the daemon socket directly.
+NAVIGATE_WAIT_UNTIL_VALUES = ("load", "domcontentloaded", "networkidle")
+DEFAULT_NAVIGATE_WAIT_UNTIL = "load"
+# After a non-``load`` navigate, wait up to this long for network idle (500 ms quiet) so
+# client-rendered prices/text land before the auto-snapshot. 0 = no settle.
+DEFAULT_NAVIGATE_SETTLE_MS = 0
+MAX_NAVIGATE_SETTLE_MS = 10_000
 _cached_cloud_provider: Optional[BrowserProvider] = None
 _cloud_provider_resolved = False
 _cached_cloud_provider_scope: Optional[str] = None
@@ -205,6 +219,32 @@ def get_browser_snapshot_threshold() -> int:
         "snapshot_threshold", DEFAULT_SNAPSHOT_THRESHOLD,
         lambda v: DEFAULT_SNAPSHOT_THRESHOLD if v is None else max(int(v), MIN_SNAPSHOT_THRESHOLD),
         "browser.snapshot_threshold",
+    )
+
+
+def _parse_navigate_wait_until(value) -> str:
+    """Case/whitespace-insensitive known value, else the default (``load``)."""
+    normalized = value.strip().lower() if isinstance(value, str) else None
+    return normalized if normalized in NAVIGATE_WAIT_UNTIL_VALUES else DEFAULT_NAVIGATE_WAIT_UNTIL
+
+
+def get_navigate_wait_until() -> str:
+    """``browser.navigate_wait_until`` (load|domcontentloaded|networkidle; unknown -> load)."""
+    return _cached_browser_cfg(
+        "_cached_navigate_wait_until", "_navigate_wait_until_resolved",
+        "navigate_wait_until", DEFAULT_NAVIGATE_WAIT_UNTIL,
+        _parse_navigate_wait_until,
+        "browser.navigate_wait_until",
+    )
+
+
+def get_navigate_settle_ms() -> int:
+    """``browser.navigate_settle_ms`` (clamped to 0..MAX_NAVIGATE_SETTLE_MS)."""
+    return _cached_browser_cfg(
+        "_cached_navigate_settle_ms", "_navigate_settle_ms_resolved",
+        "navigate_settle_ms", DEFAULT_NAVIGATE_SETTLE_MS,
+        lambda v: DEFAULT_NAVIGATE_SETTLE_MS if v is None else min(max(int(v), 0), MAX_NAVIGATE_SETTLE_MS),
+        "browser.navigate_settle_ms",
     )
 
 
@@ -730,8 +770,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(nav_session_key)
 
-    result = _session._run_browser_command(nav_session_key, "open", [url],
-                                  timeout=_get_open_command_timeout(first_open=is_first_nav))
+    result = _session._run_navigate(nav_session_key, url,
+                                    timeout=_get_open_command_timeout(first_open=is_first_nav))
     if not result.get("success"):
         return _dumps(_err(result.get("error", "Navigation failed")))
 
