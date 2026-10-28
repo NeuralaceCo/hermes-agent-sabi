@@ -85,6 +85,8 @@ _SENTINEL = os.environ["HERMES_KERNEL_SENTINEL"]
 _CAPTURE_LIMIT = {capture_limit}
 _SPILL_DIR = os.environ.get("HERMES_KERNEL_SPILL_DIR", "")
 _SPILL_CAP = {spill_cap}
+# Cap (A126 §4): read once at spawn, before any cell runs, so a cell can't unmask its spills.
+_CAP_MASK = os.environ.get("CAP_RUN_TOKEN", "")
 _PARENT_PROCESS_HANDLE = os.environ.pop("HERMES_KERNEL_PARENT_PROCESS_HANDLE", "")
 _PARENT_DEATH_FD = os.environ.pop("HERMES_KERNEL_PARENT_DEATH_FD", "")
 
@@ -182,6 +184,8 @@ def _spill(text, spill_name):
     """Best-effort: write the FULL clipped stdout to disk, return its path or ""."""
     if not _SPILL_DIR:
         return ""
+    if _CAP_MASK:  # Cap (A126 §4): never write the run credential to disk
+        text = text.replace(_CAP_MASK, "[REDACTED:cap-run-token]")
     try:
         spill_path = os.path.join(_SPILL_DIR, spill_name)
         with open(spill_path, "w", encoding="utf-8", errors="replace") as f:
@@ -429,6 +433,32 @@ def _resolve_owner(task_id: str) -> str:
     except Exception:
         pass
     return owner
+
+
+def _token_fingerprint(token: str) -> str:
+    import hashlib
+    return hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""
+
+
+def _run_token_scope() -> str:
+    """Kernel env is frozen at spawn, so a kernel must never serve a cell whose Cap run credential
+    differs from the one it was spawned with (a fingerprint, never the token: keys get logged)."""
+    from gateway.session_context import cap_run_token
+    return _token_fingerprint(cap_run_token())
+
+
+def shutdown_kernels_for_run(owner: str, token: str) -> None:
+    """Kill the kernels a /v1/runs run spawned under its Cap credential (its own and its delegated
+    children's) when the run ends, so none keeps the credential in its env (A126 §4). Kernels of
+    the same owner without that credential (a background child, which drops it) keep working."""
+    scope = _token_fingerprint(token)
+    if not owner or not scope:
+        return
+    with _REGISTRY.lock:
+        doomed = [_KERNELS.pop(k) for k in list(_KERNELS)
+                  if k[-1] == scope and (k[0] == owner or str(k[0]).startswith(f"{owner}::child::"))]
+    for kernel in doomed:
+        kernel.teardown()
 
 
 def shutdown_all_kernels() -> None:
@@ -735,8 +765,9 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
             result["output"] = _with_stderr(stdout_text, cell_stderr)
     elif status == "error":
         _REGISTRY.discard(key, kernel)
+        died = clean(stderr_raw).strip()
         result.update(exit_code=-1, error="The session kernel died while running the cell"
-                      + (": " + stderr_raw.strip() if stderr_raw.strip() else "."))
+                      + (": " + died if died else "."))
     elif cell_stderr:
         result["output"] = _with_stderr(stdout_text, cell_stderr)
     return result
@@ -748,7 +779,8 @@ def execute_in_session_kernel(
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
     session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
-    key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
+    key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)),
+           _run_token_scope())
     exec_start = time.monotonic()
     kernel, state_reset = _acquire_kernel(key, reset)
     try:

@@ -855,7 +855,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _spawn_env(env_vars: dict) -> dict:
         """Sanitized child env; PYTHONUNBUFFERED so tqdm/datasets-style buffering
         doesn't hide progress from process(action="poll")."""
+        from gateway.session_context import CAP_RUN_TOKEN_ENV
         env = _sanitize_subprocess_env(os.environ, env_vars)
+        # Cap (A126 §4): a background process outlives the run (and a later turn can drive or read
+        # it), so it never carries the run credential; its cap-cli sends ask, the safe direction.
+        env.pop(CAP_RUN_TOKEN_ENV, None)
         env["PYTHONUNBUFFERED"] = "1"
         return env
 

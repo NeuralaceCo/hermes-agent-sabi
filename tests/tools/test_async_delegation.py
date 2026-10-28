@@ -1126,3 +1126,33 @@ print(json.dumps(q.get_nowait(), sort_keys=True))
     assert by_index[1]["status"] == "unknown"
     assert "1/2 child results were recorded" in evt["error"]
     assert "done: fast member" in format_process_notification(evt)
+
+
+def test_background_child_never_holds_the_routine_runs_cap_credential():
+    """Cap (A126 §4): a background child outlives the run on a copied context, so it must not
+    carry the run's credential into its terminal / execute_code calls."""
+    import contextvars
+
+    from gateway.session_context import cap_run_token, clear_session_vars, set_session_vars
+
+    seen, done = {}, threading.Event()
+
+    def runner():
+        seen["child"] = cap_run_token()
+        done.set()
+        return {"status": "completed", "summary": "done"}
+
+    def parent():
+        tokens = set_session_vars(platform="api_server", cap_run_token="tok-a")
+        try:
+            res = ad.dispatch_async_delegation(
+                goal="g", context=None, toolsets=None, role="leaf", model="m",
+                session_key="", runner=runner, max_async_children=3)
+            assert res["status"] == "dispatched"
+            assert done.wait(5)
+            return cap_run_token()
+        finally:
+            clear_session_vars(tokens)
+
+    assert contextvars.Context().run(parent) == "tok-a"  # the run itself keeps it
+    assert seen["child"] == ""

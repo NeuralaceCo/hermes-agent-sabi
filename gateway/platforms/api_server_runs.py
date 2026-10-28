@@ -5,10 +5,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 try:
@@ -425,6 +426,8 @@ class _RunLaunch:
     request_profile: Any
     browser_control_principal: Any
     browser_control_transport_family: Any
+    # Cap (A126 §4): body.cap_run_token, bound for this run only; repr=False keeps it out of logs.
+    cap_run_token: str = field(default="", repr=False)
 
     @property
     def approval_session_key(self) -> str:
@@ -435,6 +438,21 @@ class _RunLaunch:
         """Enqueue only while this run still owns live transport state."""
         if self.owner._run_streams.get(self.run_id) is self.queue:
             self.queue.put_nowait(event)
+
+
+# cap-ts sends an HS256 JWT. A shell-inert alphabet keeps the value byte-identical in an
+# ``export -p`` dump, so the host-side snapshot check can match it literally.
+_CAP_RUN_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,4096}")
+
+
+def _cap_run_token(body: Any) -> str:
+    """Cap (A126 §4): the optional per-run credential; anything but a bounded string in the JWT
+    alphabet is dropped (the run then has no credential, so its sends ask — the safe direction)."""
+    token = body.get("cap_run_token") if isinstance(body, dict) else None
+    if not isinstance(token, str):
+        return ""
+    token = token.strip()
+    return token if _CAP_RUN_TOKEN_RE.fullmatch(token) else ""
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
@@ -481,7 +499,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
         idempotency_fingerprint = hashlib.sha256(json.dumps(
-            {"body": body, "gateway_session_key": gateway_session_key or ""},
+            # cap_run_token is a fresh credential per claim, not part of what the request asks for.
+            {"body": {k: v for k, v in body.items() if k != "cap_run_token"},
+             "gateway_session_key": gateway_session_key or ""},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode()).hexdigest()
     raw_input = body.get("input")
@@ -553,7 +573,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
-        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get())
+        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
+        cap_run_token=_cap_run_token(body))
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -589,7 +610,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             session_tokens = self._bind_api_server_session(
                 chat_id=session_id or "", session_key=run.approval_session_key, session_id=session_id or "",
                 browser_control_principal=run.browser_control_principal,
-                browser_control_transport_family=run.browser_control_transport_family)
+                browser_control_transport_family=run.browser_control_transport_family,
+                cap_run_token=run.cap_run_token)
             if session_tokens:
                 resets.append((session_tokens, clear_session_vars))
             if run.agent_kwargs["room_dispatch"] is not None:
@@ -615,6 +637,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
+                if run.cap_run_token:
+                    # The run's execute_code kernels hold its credential in their env: end them with it.
+                    from tools.code_kernel import shutdown_kernels_for_run
+                    with suppress(Exception):
+                        shutdown_kernels_for_run(run.approval_session_key, run.cap_run_token)
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 

@@ -793,6 +793,10 @@ class AIAgent(
             )
 
             def _target_with_requeue() -> None:
+                # The review outlives the turn on a copied context: it must not hold a Cap run
+                # credential (A126 §4) that belongs to the routine run that just finished.
+                from gateway.session_context import drop_cap_run_token
+                drop_cap_run_token()
                 target()
                 self._maybe_requeue_preempted_review(review_run, dict(
                     messages_snapshot=messages_snapshot, review_memory=review_memory, review_skills=review_skills,

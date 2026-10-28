@@ -595,6 +595,10 @@ def _dispatch(
     executor = _get_executor(max(max_async_children, live_units))
 
     def _worker() -> None:
+        # A background child outlives the turn on a copied context: it must not hold the
+        # routine run's Cap credential (A126 §4); its sends then ask, the safe direction.
+        from gateway.session_context import drop_cap_run_token
+        drop_cap_run_token()
         result: Dict[str, Any] = {}
         status = "error"
         with _records_lock:

@@ -1,11 +1,13 @@
 """Local execution environment — spawn-per-call with session snapshot."""
 
 import contextlib
+import contextvars
 import logging
 import ntpath
 import os
 import platform
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -540,9 +542,12 @@ def _path_env_key(run_env: dict) -> str | None:
 
 
 def _make_run_env(env: dict) -> dict:
-    """Build a run environment with a sane PATH and provider-var stripping."""
-    return _scrubbed_env([(dict(os.environ | env), True)], frozenset(),
-                         lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    """Build a run environment with a sane PATH and provider-var stripping; the foreground
+    terminal also gets (only) the current run's Cap run credential."""
+    from gateway.session_context import apply_cap_run_token
+    return apply_cap_run_token(_scrubbed_env(
+        [(dict(os.environ | env), True)], frozenset(),
+        lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p))))
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---
@@ -682,6 +687,31 @@ def _kill_process_windows(proc) -> None:
         proc.wait(timeout=2.0)
 
 
+# Cap (A126 §4): during a routine run, bash moves the finished snapshot dump to this staging path
+# (in the ``.tmp.*`` namespace cleanup() sweeps), never onto the shared snapshot itself.
+_SNAPSHOT_STAGE = contextvars.ContextVar("hermes_local_snapshot_stage", default="")
+
+
+def _publish_staged_snapshot(stage: str, path: str, token: str) -> None:
+    """Move the staged dump onto the shared snapshot only if it does not hold *token* (the run's
+    registry value, not the shell's mutable $CAP_RUN_TOKEN); otherwise discard it, so no reader
+    sharing the env ever sees it and the previous snapshot stays."""
+    try:
+        with open(stage, encoding="utf-8", errors="surrogateescape") as f:
+            text = f.read()
+    except OSError:
+        return  # bash never staged a dump (failed, or unchanged)
+    try:
+        if token in text:
+            logger.warning("terminal snapshot held a routine run credential; kept the previous snapshot")
+            os.unlink(stage)
+        else:
+            os.replace(stage, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(stage)
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host: every execute() spawns a fresh bash;
     the session snapshot preserves env vars across calls; CWD persists via the
@@ -769,6 +799,40 @@ class LocalEnvironment(BaseEnvironment):
                 "falling back to %r so terminal commands keep working.",
                 self.cwd, safe_cwd)
         self.cwd = safe_cwd
+
+    @contextlib.contextmanager
+    def _run_token_snapshot_stage(self):
+        """Cap (A126 §4): while a routine run's credential is bound, snapshot dumps are staged
+        and validated host-side before they replace the shared snapshot."""
+        from gateway.session_context import cap_run_token
+        token = cap_run_token()
+        if not token:
+            yield False
+            return
+        stage = f"{self._snapshot_path}.tmp.run-{secrets.token_hex(8)}"
+        reset = _SNAPSHOT_STAGE.set(stage)
+        try:
+            yield True
+        finally:
+            _SNAPSHOT_STAGE.reset(reset)
+            _publish_staged_snapshot(stage, self._snapshot_path, token)
+
+    def _snapshot_script_kwargs(self, cwd: str) -> dict:
+        kwargs = super()._snapshot_script_kwargs(cwd)
+        stage = _SNAPSHOT_STAGE.get()
+        if stage.startswith(f"{self._snapshot_path}.tmp.run-"):
+            kwargs["quoted_publish"] = self._quote_shell_path(stage)
+        return kwargs
+
+    def init_session(self):
+        with self._run_token_snapshot_stage() as staged:
+            super().init_session()
+        if staged and self._snapshot_ready and not os.path.exists(self._snapshot_path):
+            self._snapshot_ready = False  # the bootstrap dump was rejected: bash -l per command
+
+    def execute(self, command: str, *args, **kwargs) -> dict:
+        with self._run_token_snapshot_stage():
+            return super().execute(command, *args, **kwargs)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:

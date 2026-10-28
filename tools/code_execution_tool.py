@@ -88,6 +88,8 @@ def _spill_full_stdout(stdout_text: str) -> Optional[str]:
         if len(stdout_text) > MAX_SPILLED_STDOUT_BYTES:
             stdout_text = (stdout_text[:MAX_SPILLED_STDOUT_BYTES]
                            + f"\n\n[... spill capped at {MAX_SPILLED_STDOUT_BYTES:,} bytes ...]")
+        from agent.redact import _mask_cap_run_tokens
+        stdout_text = _mask_cap_run_tokens(stdout_text)  # the spill outlives the run (A126 §4)
         cache_dir = get_hermes_dir("cache/exec", "exec_spill")
         cache_dir.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(stdout_text.encode("utf-8", errors="replace")).hexdigest()[:12]

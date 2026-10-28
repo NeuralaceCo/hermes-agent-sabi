@@ -178,3 +178,31 @@ def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     assert agent.run_conversation("hello") == {"final_response": "ok"}
     assert observed == [agent]
     assert get_active_subagent_parent() is None
+
+
+def test_plugin_subagent_never_holds_the_routine_runs_cap_credential(lifecycle, monkeypatch):
+    """Cap (A126 §4): the lifecycle executor copies the caller's context and the subagent can
+    outlive the turn, so it must not carry the run's credential into its tool calls."""
+    import contextvars
+
+    from gateway.session_context import cap_run_token, clear_session_vars, set_session_vars
+
+    seen = {}
+
+    def run(_index, _goal, _child, _parent):
+        seen["child"] = cap_run_token()
+        return {"status": "completed", "summary": "ok", "api_calls": 1, "duration_seconds": 0.01}
+
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", run)
+
+    def parent():
+        tokens = set_session_vars(platform="api_server", cap_run_token="tok-a")
+        try:
+            handle = lifecycle.launch(SubagentLaunchRequest(goal="x"))
+            assert lifecycle.wait(handle, timeout_seconds=5).state is SubagentState.SUCCEEDED
+            return cap_run_token()
+        finally:
+            clear_session_vars(tokens)
+
+    assert contextvars.Context().run(parent) == "tok-a"
+    assert seen["child"] == ""

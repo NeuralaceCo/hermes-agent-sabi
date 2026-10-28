@@ -218,6 +218,11 @@ def yield_to_background_handler(
     adoptable host process) and the foreground wait continues."""
     if env_type != "local":
         return None
+    from gateway.session_context import cap_run_token
+    if cap_run_token():
+        # Cap (A126 §4): this Popen carries the run credential and an adopted process outlives
+        # the run, so a routine run's foreground command is never adopted; the wait continues.
+        return None
 
     def _handler(proc, output_so_far: str) -> dict:
         from tools.process_registry import process_registry

@@ -555,6 +555,26 @@ def _redact_phone(m):
     return phone[:keep] + "****" + phone[-keep:]
 
 
+_CAP_RUN_HEADER_RE = re.compile(r"(X-Cap-Run-Token\s*[:=]\s*)[^\s\"',;]+", re.IGNORECASE)
+_CAP_RUN_MASK = "[REDACTED:cap-run-token]"
+
+
+def _mask_cap_run_tokens(text: str) -> str:
+    if not text:
+        return text
+    try:
+        from gateway.session_context import known_cap_run_tokens
+        values = known_cap_run_tokens()
+    except Exception:
+        values = []
+    for value in values:
+        if value and value in text:
+            text = text.replace(value, _CAP_RUN_MASK)
+    if "x-cap-run-token" in text.lower():
+        text = _CAP_RUN_HEADER_RE.sub(lambda m: m.group(1) + _CAP_RUN_MASK, text)
+    return text
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, redact_url_credentials: bool = False) -> str:
     """Apply all redaction patterns to a block of text.
@@ -583,6 +603,9 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if text is None:
         return None
     text = text if isinstance(text, str) else str(text)
+    # Cap (A126 §4): a routine run's credential is masked by value whatever the redact setting —
+    # it is opaque to every pattern below (``printenv CAP_RUN_TOKEN``, an execute_code print).
+    text = _mask_cap_run_tokens(text)
     if not text or not (force or _REDACT_ENABLED):
         return text
     code_file = code_file or file_read
