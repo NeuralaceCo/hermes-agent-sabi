@@ -431,6 +431,15 @@ def _resolve_owner(task_id: str) -> str:
     return owner
 
 
+def _run_token_scope() -> str:
+    """Kernel env is frozen at spawn, so a kernel must never serve a cell whose Cap run credential
+    differs from the one it was spawned with (a fingerprint, never the token: keys get logged)."""
+    import hashlib
+    from gateway.session_context import cap_run_token
+    token = cap_run_token()
+    return hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""
+
+
 def shutdown_all_kernels() -> None:
     """Kill every session kernel. Registered via atexit; also used by tests."""
     _REGISTRY.shutdown()
@@ -748,7 +757,8 @@ def execute_in_session_kernel(
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
     session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
-    key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
+    key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)),
+           _run_token_scope())
     exec_start = time.monotonic()
     kernel, state_reset = _acquire_kernel(key, reset)
     try:

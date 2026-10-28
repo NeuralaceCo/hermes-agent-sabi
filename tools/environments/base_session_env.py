@@ -28,7 +28,7 @@ from typing import Iterable
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)")
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|CAP_RUN_TOKEN=)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # mktemp template suffix + the shell variable holding the allocated temp path.
@@ -72,6 +72,9 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # by every wrapper with ${VAR:-default} semantics; persisting them would
         # let the FIRST command's value override a later outer-harness value.
         "AI_AGENT HERMES_AGENT "
+        # Cap's per-run credential (gateway.session_context.CAP_RUN_TOKEN_ENV): injected per
+        # command for one run only; a snapshot copy would hand it to every later command.
+        "CAP_RUN_TOKEN "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")

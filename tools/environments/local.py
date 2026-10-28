@@ -540,9 +540,12 @@ def _path_env_key(run_env: dict) -> str | None:
 
 
 def _make_run_env(env: dict) -> dict:
-    """Build a run environment with a sane PATH and provider-var stripping."""
-    return _scrubbed_env([(dict(os.environ | env), True)], frozenset(),
-                         lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    """Build a run environment with a sane PATH and provider-var stripping; the foreground
+    terminal also gets (only) the current run's Cap run credential."""
+    from gateway.session_context import apply_cap_run_token
+    return apply_cap_run_token(_scrubbed_env(
+        [(dict(os.environ | env), True)], frozenset(),
+        lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p))))
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---

@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 try:
@@ -425,6 +425,8 @@ class _RunLaunch:
     request_profile: Any
     browser_control_principal: Any
     browser_control_transport_family: Any
+    # Cap (A126 §4): body.cap_run_token, bound for this run only; repr=False keeps it out of logs.
+    cap_run_token: str = field(default="", repr=False)
 
     @property
     def approval_session_key(self) -> str:
@@ -435,6 +437,16 @@ class _RunLaunch:
         """Enqueue only while this run still owns live transport state."""
         if self.owner._run_streams.get(self.run_id) is self.queue:
             self.queue.put_nowait(event)
+
+
+def _cap_run_token(body: Any) -> str:
+    """Cap (A126 §4): the optional per-run credential; anything but a bounded single-line string
+    is dropped (the run then has no credential, so its sends ask — the safe direction)."""
+    token = body.get("cap_run_token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or len(token) > 4096:
+        return ""
+    token = token.strip()
+    return token if token.isprintable() else ""
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
@@ -553,7 +565,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
-        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get())
+        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
+        cap_run_token=_cap_run_token(body))
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -589,7 +602,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             session_tokens = self._bind_api_server_session(
                 chat_id=session_id or "", session_key=run.approval_session_key, session_id=session_id or "",
                 browser_control_principal=run.browser_control_principal,
-                browser_control_transport_family=run.browser_control_transport_family)
+                browser_control_transport_family=run.browser_control_transport_family,
+                cap_run_token=run.cap_run_token)
             if session_tokens:
                 resets.append((session_tokens, clear_session_vars))
             if run.agent_kwargs["room_dispatch"] is not None:

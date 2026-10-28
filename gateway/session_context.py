@@ -57,6 +57,13 @@ _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", de
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Cap (A126 §4): one routine run's per-run credential, bound per /v1/runs run (body.cap_run_token)
+# and handed ONLY to the spawn surfaces that can run cap-cli (terminal foreground/background,
+# execute_code). Deliberately NOT in _VAR_MAP: it is a credential, so it must not ride every child
+# env, get_session_env's os.environ fallback, or a long-lived daemon. Never logged, never persisted.
+CAP_RUN_TOKEN_ENV = "CAP_RUN_TOKEN"
+_CAP_RUN_TOKEN = ContextVar(CAP_RUN_TOKEN_ENV, default=_UNSET)
+
 # Legacy env-var name -> ContextVar for get_session_env (_SESSION_ASYNC_DELIVERY deliberately
 # absent: it is a bool capability, read via async_delivery_supported).
 _VAR_MAP = {var.name: var for var in (
@@ -115,6 +122,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
+    cap_run_token: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -128,6 +136,8 @@ def set_session_vars(
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
+    # Every bind sets it (default ""), so a chat turn or cron reusing a thread never sees a run's token.
+    tokens.append(_CAP_RUN_TOKEN.set(cap_run_token if isinstance(cap_run_token, str) else ""))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -138,6 +148,7 @@ def clear_session_vars(tokens: list) -> None:
     goes back to ``_UNSET``: a cleared context is default-supported, not opted-out."""
     for var in _SESSION_VARS:
         var.set("")
+    _CAP_RUN_TOKEN.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
@@ -149,8 +160,30 @@ def reset_session_vars() -> None:
     identity.  ``_SESSION_ASYNC_DELIVERY`` (outside ``_VAR_MAP``) is reset explicitly too."""
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _CAP_RUN_TOKEN.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
+
+
+def cap_run_token() -> str:
+    """The current run's Cap run credential, or "" outside a routine run."""
+    value = _CAP_RUN_TOKEN.get()
+    return value if isinstance(value, str) else ""
+
+
+def drop_cap_run_token() -> None:
+    """Unbind the run credential in THIS context only (for work that outlives the run on a
+    copied context, e.g. the post-turn background review)."""
+    _CAP_RUN_TOKEN.set("")
+
+
+def apply_cap_run_token(env: dict) -> dict:
+    """Make *env*'s CAP_RUN_TOKEN exactly the current run's credential: set when bound, removed
+    otherwise — an inherited os.environ / snapshot value never survives. Returns *env*."""
+    env.pop(CAP_RUN_TOKEN_ENV, None)
+    if token := cap_run_token():
+        env[CAP_RUN_TOKEN_ENV] = token
+    return env
 
 
 def get_session_env(name: str, default: str = "") -> str:

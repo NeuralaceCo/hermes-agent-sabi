@@ -126,6 +126,10 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     if _tz_name:
         child_env["TZ"] = _tz_name
     child_env.pop("HERMES_TIMEZONE", None)
+    # Cap (A126 §4): the scrub drops *TOKEN* names; a routine run's cap-cli calls from the
+    # script need the run's own credential (the session kernel keys on it, see code_kernel).
+    from gateway.session_context import apply_cap_run_token
+    apply_cap_run_token(child_env)
     apply_subprocess_home_env(child_env)
     # PYTHONPATH: the staging dir (hermes_tools.py) must always be importable even when project
     # mode changes CWD. Hermes's root is added ONLY when the child runs in Hermes's Python env —
