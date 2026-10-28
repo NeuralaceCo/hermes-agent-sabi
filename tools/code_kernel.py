@@ -85,6 +85,8 @@ _SENTINEL = os.environ["HERMES_KERNEL_SENTINEL"]
 _CAPTURE_LIMIT = {capture_limit}
 _SPILL_DIR = os.environ.get("HERMES_KERNEL_SPILL_DIR", "")
 _SPILL_CAP = {spill_cap}
+# Cap (A126 §4): read once at spawn, before any cell runs, so a cell can't unmask its spills.
+_CAP_MASK = os.environ.get("CAP_RUN_TOKEN", "")
 _PARENT_PROCESS_HANDLE = os.environ.pop("HERMES_KERNEL_PARENT_PROCESS_HANDLE", "")
 _PARENT_DEATH_FD = os.environ.pop("HERMES_KERNEL_PARENT_DEATH_FD", "")
 
@@ -182,9 +184,8 @@ def _spill(text, spill_name):
     """Best-effort: write the FULL clipped stdout to disk, return its path or ""."""
     if not _SPILL_DIR:
         return ""
-    _tok = os.environ.get("CAP_RUN_TOKEN", "")
-    if _tok:  # Cap (A126 §4): never write the run credential to disk
-        text = text.replace(_tok, "[REDACTED:cap-run-token]")
+    if _CAP_MASK:  # Cap (A126 §4): never write the run credential to disk
+        text = text.replace(_CAP_MASK, "[REDACTED:cap-run-token]")
     try:
         spill_path = os.path.join(_SPILL_DIR, spill_name)
         with open(spill_path, "w", encoding="utf-8", errors="replace") as f:
@@ -764,8 +765,9 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
             result["output"] = _with_stderr(stdout_text, cell_stderr)
     elif status == "error":
         _REGISTRY.discard(key, kernel)
+        died = clean(stderr_raw).strip()
         result.update(exit_code=-1, error="The session kernel died while running the cell"
-                      + (": " + stderr_raw.strip() if stderr_raw.strip() else "."))
+                      + (": " + died if died else "."))
     elif cell_stderr:
         result["output"] = _with_stderr(stdout_text, cell_stderr)
     return result

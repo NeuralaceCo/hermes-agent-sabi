@@ -47,6 +47,26 @@ class _BoundedOutputCollector:
         self._spill_fh: IO[str] | None = None
         self._spill_chars = 0
         self._spill_capped = False
+        # Cap (A126 §4): run credentials live when the command started are masked before any
+        # spill write; the last len(token)-1 chars wait so a token split across chunks is caught.
+        try:
+            from gateway.session_context import known_cap_run_tokens
+            self._spill_masks = sorted({t for t in known_cap_run_tokens() if t}, key=len, reverse=True)
+        except Exception:
+            self._spill_masks = []
+        self._spill_keep = max((len(t) for t in self._spill_masks), default=1) - 1
+        self._spill_pending = ""
+
+    def _spill_write(self, text: str, *, final: bool = False) -> None:
+        if not self._spill_masks:
+            self._spill_fh.write(text)
+            return
+        buf = self._spill_pending + text
+        for token in self._spill_masks:
+            buf = buf.replace(token, "[REDACTED:cap-run-token]")
+        cut = len(buf) if final else max(0, len(buf) - self._spill_keep)
+        self._spill_fh.write(buf[:cut])
+        self._spill_pending = buf[cut:]
 
     def _maybe_spill(self, text: str) -> None:
         """Tee ``text`` to the spill file (opened lazily on first overflow)."""
@@ -61,15 +81,15 @@ class _BoundedOutputCollector:
                 self._spill_fh = open_exclusive(self._spill_path, private=True, errors="replace")
                 # Backfill what's retained so the file holds the stream from byte 0.
                 backlog = "".join(self._head) + "".join(self._tail)
-                self._spill_fh.write(backlog)
+                self._spill_write(backlog)
                 self._spill_chars = len(backlog)
             budget = self._SPILL_CAP_CHARS - self._spill_chars
             if budget <= 0 or len(text) > budget:
-                self._spill_fh.write(text[:max(0, budget)])
+                self._spill_write(text[:max(0, budget)], final=True)
                 self._spill_fh.write("\n... [spill capped at 5,000,000 chars] ...\n")
                 self._spill_capped = True
             else:
-                self._spill_fh.write(text)
+                self._spill_write(text)
             self._spill_chars += len(text)
         except OSError:
             # Disk trouble must never break command execution.
@@ -81,6 +101,8 @@ class _BoundedOutputCollector:
             if self._spill_fh is None:
                 return None
             try:
+                if self._spill_pending and not self._spill_capped:
+                    self._spill_write("", final=True)
                 self._spill_fh.close()
             except OSError:
                 pass

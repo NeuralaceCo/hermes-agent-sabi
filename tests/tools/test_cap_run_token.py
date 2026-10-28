@@ -378,6 +378,7 @@ def test_a_late_kernel_spawned_after_the_run_ends_gets_no_token():
 @pytest.mark.parametrize("command", [
     f"readonly {CAP_RUN_TOKEN_ENV}",                      # survives unset: export -p writes -rx
     f'export COPY_OF_IT="${CAP_RUN_TOKEN_ENV}"',          # the value under another name
+    f'export COPY_OF_IT="${CAP_RUN_TOKEN_ENV}"; unset {CAP_RUN_TOKEN_ENV}',  # ...and the shell var gone
 ])
 def test_snapshot_never_publishes_the_token_even_when_unset_cannot_remove_it(tmp_path, command):
     from tools.environments.local import LocalEnvironment
@@ -454,3 +455,62 @@ def test_terminal_tool_result_never_shows_the_token(tmp_path):
         result = _fresh(body)
     assert "opaque-run-credential-c0de" not in json.dumps(result)
     assert "[REDACTED:cap-run-token]" in result.get("output", ""), result
+
+
+# --- kernel and terminal output that leaves the process -----------------------------------------
+
+def _kernel_cell(code, token="opaque-run-credential-k3rn"):
+    from tools.approval_context import reset_current_session_key, set_current_session_key
+    from tools.code_execution_tool import execute_code
+
+    def body():
+        key = set_current_session_key("run_k")
+        try:
+            with _bound(platform="", cap_run_token=token):
+                return json.loads(execute_code(code, task_id="t"))
+        finally:
+            reset_current_session_key(key)
+
+    return _fresh(body)
+
+
+def test_a_dying_kernels_error_never_shows_the_token():
+    with _kernel():
+        result = _kernel_cell(
+            "import os, time\nos.write(2, ('boom ' + os.environ['CAP_RUN_TOKEN'] + '\\n').encode())\n"
+            "time.sleep(0.5)\nos._exit(3)")
+    assert result["status"] == "error", result
+    assert "boom" in result.get("error", ""), result  # the death message really carries stderr
+    assert "opaque-run-credential-k3rn" not in json.dumps(result)
+
+
+def test_a_kernel_spill_is_masked_even_after_the_cell_pops_the_env_var():
+    with _kernel():
+        result = _kernel_cell(
+            "import os\nt = os.environ.pop('CAP_RUN_TOKEN')\nprint(t + 'x' * 1_100_000)")
+        spill = result.get("stdout_spill_path")
+        assert spill and os.path.exists(spill), result  # read before the kernel's tmpdir goes
+        with open(spill) as f:
+            text = f.read()
+    assert "opaque-run-credential-k3rn" not in text and "[REDACTED:cap-run-token]" in text
+
+
+def test_terminal_spill_masks_the_token_even_split_across_chunks(tmp_path):
+    from tools.environments.base_output import _BoundedOutputCollector
+
+    secret = "opaque-run-credential-sp1l"
+
+    def body():
+        with _bound(cap_run_token=secret):
+            collector = _BoundedOutputCollector(max_chars=50, spill_path=tmp_path / "spill.txt")
+        for chunk in ("a" * 60, secret[:7], secret[7:15], secret[15:] + "b" * 10, "tail " + secret[:5]):
+            collector.append(chunk)
+        collector.append(secret[5:])
+        return collector.close_spill()
+
+    path = _fresh(body)
+    with open(path) as f:
+        text = f.read()
+    assert secret not in text
+    assert text.count("[REDACTED:cap-run-token]") == 2
+    assert text.startswith("a" * 60) and "b" * 10 in text

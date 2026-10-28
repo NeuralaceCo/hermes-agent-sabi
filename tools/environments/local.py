@@ -685,6 +685,36 @@ def _kill_process_windows(proc) -> None:
         proc.wait(timeout=2.0)
 
 
+def _read_text_or_none(path: str) -> "str | None":
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _restore_snapshot_without(path: str, token: str, before: "str | None") -> None:
+    """If the snapshot at *path* now holds *token*, put back *before* (atomically) or remove it.
+    ponytail: a concurrent session's snapshot update in the same window is lost too; it re-dumps
+    on its next command."""
+    after = _read_text_or_none(path)
+    if after is None or token not in after:
+        return
+    logger.warning("terminal snapshot held a routine run credential; restored the previous snapshot")
+    try:
+        if before is None or token in before:
+            os.unlink(path)
+            return
+        tmp = f"{path}.restore-{os.getpid()}-{threading.get_ident()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(before)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host: every execute() spawns a fresh bash;
     the session snapshot preserves env vars across calls; CWD persists via the
@@ -772,6 +802,20 @@ class LocalEnvironment(BaseEnvironment):
                 "falling back to %r so terminal commands keep working.",
                 self.cwd, safe_cwd)
         self.cwd = safe_cwd
+
+    def execute(self, command: str, *args, **kwargs) -> dict:
+        """Cap (A126 §4): during a routine run, the shared snapshot is checked host-side after the
+        command against the run's own credential (from the grant registry, not the shell's
+        mutable $CAP_RUN_TOKEN). A snapshot holding it, under any name, is put back as it was."""
+        from gateway.session_context import cap_run_token
+        token = cap_run_token()
+        if not token:
+            return super().execute(command, *args, **kwargs)
+        before = _read_text_or_none(self._snapshot_path)
+        try:
+            return super().execute(command, *args, **kwargs)
+        finally:
+            _restore_snapshot_without(self._snapshot_path, token, before)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
