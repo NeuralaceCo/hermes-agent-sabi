@@ -182,6 +182,9 @@ def _spill(text, spill_name):
     """Best-effort: write the FULL clipped stdout to disk, return its path or ""."""
     if not _SPILL_DIR:
         return ""
+    _tok = os.environ.get("CAP_RUN_TOKEN", "")
+    if _tok:  # Cap (A126 §4): never write the run credential to disk
+        text = text.replace(_tok, "[REDACTED:cap-run-token]")
     try:
         spill_path = os.path.join(_SPILL_DIR, spill_name)
         with open(spill_path, "w", encoding="utf-8", errors="replace") as f:
@@ -431,23 +434,28 @@ def _resolve_owner(task_id: str) -> str:
     return owner
 
 
-def _run_token_scope() -> str:
-    """Kernel env is frozen at spawn, so a kernel must never serve a cell whose Cap run credential
-    differs from the one it was spawned with (a fingerprint, never the token: keys get logged)."""
+def _token_fingerprint(token: str) -> str:
     import hashlib
-    from gateway.session_context import cap_run_token
-    token = cap_run_token()
     return hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""
 
 
-def shutdown_kernels_for_run(owner: str) -> None:
-    """Kill the kernels a /v1/runs run owns (its own and its delegated children's) when the run
-    ends, so none keeps the run's Cap credential in its env (A126 §4)."""
-    if not owner:
+def _run_token_scope() -> str:
+    """Kernel env is frozen at spawn, so a kernel must never serve a cell whose Cap run credential
+    differs from the one it was spawned with (a fingerprint, never the token: keys get logged)."""
+    from gateway.session_context import cap_run_token
+    return _token_fingerprint(cap_run_token())
+
+
+def shutdown_kernels_for_run(owner: str, token: str) -> None:
+    """Kill the kernels a /v1/runs run spawned under its Cap credential (its own and its delegated
+    children's) when the run ends, so none keeps the credential in its env (A126 §4). Kernels of
+    the same owner without that credential (a background child, which drops it) keep working."""
+    scope = _token_fingerprint(token)
+    if not owner or not scope:
         return
     with _REGISTRY.lock:
         doomed = [_KERNELS.pop(k) for k in list(_KERNELS)
-                  if k[0] == owner or str(k[0]).startswith(f"{owner}::child::")]
+                  if k[-1] == scope and (k[0] == owner or str(k[0]).startswith(f"{owner}::child::"))]
     for kernel in doomed:
         kernel.teardown()
 

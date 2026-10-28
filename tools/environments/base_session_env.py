@@ -80,6 +80,15 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         f"> {tmp_path}")
 
 
+def _no_run_token_in(tmp_path: str) -> str:
+    """Shell test, true only when the dumped snapshot at *tmp_path* holds neither a CAP_RUN_TOKEN
+    declaration nor the current value of $CAP_RUN_TOKEN. Fail closed: a readonly var survives
+    ``unset`` and ``export -p`` would write it (``declare -rx``); a copy under another name
+    carries the value. Either way the dump is not published and the old snapshot stays."""
+    return (f"! grep -qE '^declare -[-a-zA-Z]* CAP_RUN_TOKEN(=|$)' {tmp_path} 2>/dev/null && "
+            f"{{ [ -z \"${{CAP_RUN_TOKEN:-}}\" ] || ! grep -qF -- \"$CAP_RUN_TOKEN\" {tmp_path}; }}")
+
+
 def _snapshot_bootstrap_script(
     *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str, excluded_names: Iterable[str], cwd_marker: str,
 ) -> str:
@@ -102,7 +111,7 @@ def _snapshot_bootstrap_script(
         f"echo 'set +e' >> {_SNAP_TMP}\n"
         f"echo 'set +u' >> {_SNAP_TMP}\n"
         # Publish only if assembly succeeded; otherwise drop the partial temp.
-        f"mv -f {_SNAP_TMP} {quoted_snap} || rm -f {_SNAP_TMP}\n"
+        f"{{ {_no_run_token_in(_SNAP_TMP)} && mv -f {_SNAP_TMP} {quoted_snap}; }} || rm -f {_SNAP_TMP}\n"
         f"builtin cd -- {quoted_cwd} 2>/dev/null || true\n"
         f"{_cwd_marker_printf(cwd_marker)}\n")
 
@@ -154,7 +163,7 @@ def _wrap_command_script(
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
             f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
-            f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
+            f"&& {_no_run_token_in(_SNAP_TMP)} && mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]
     return "\n".join(parts)

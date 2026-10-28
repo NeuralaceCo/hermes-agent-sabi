@@ -128,7 +128,8 @@ def test_concurrent_runs_each_see_only_their_own_token():
 
 # --- spawn surfaces --------------------------------------------------------------------------
 
-def test_background_process_env_carries_only_the_runs_token():
+def test_background_process_env_never_carries_a_token():
+    # A background process outlives the run (and a later turn can drive or read it).
     from tools.process_registry import ProcessRegistry
 
     def body():
@@ -138,8 +139,25 @@ def test_background_process_env_carries_only_the_runs_token():
 
     with patch.dict(os.environ, {CAP_RUN_TOKEN_ENV: "ambient"}):
         inside, outside = _fresh(body)
-    assert inside[CAP_RUN_TOKEN_ENV] == "tok-a"
+    assert CAP_RUN_TOKEN_ENV not in inside
     assert CAP_RUN_TOKEN_ENV not in outside
+
+
+def test_a_routine_runs_foreground_command_is_never_adopted_into_the_background():
+    from tools.terminal_tool_background import yield_to_background_handler
+
+    def handler():
+        return yield_to_background_handler(command="x", env_type="local", cwd=None,
+                                            effective_task_id="t", task_id="t", session_key="")
+
+    def body():
+        with _bound(cap_run_token="tok-a"):
+            in_run = handler()
+        return in_run, handler()
+
+    in_run, chat = _fresh(body)
+    assert in_run is None  # the foreground wait continues
+    assert callable(chat)  # unchanged without a credential
 
 
 def test_execute_code_child_env_carries_only_the_runs_token(tmp_path):
@@ -240,7 +258,7 @@ def _cell(session_key, token=None):
                 return json.loads(execute_code(
                     "import os, subprocess, sys\n"
                     "print('[' + subprocess.run([sys.executable, '-c', "
-                    "'import os; print(os.environ.get(\"CAP_RUN_TOKEN\", \"\"), end=\"\")'], "
+                    "'import os; print(os.environ.get(\"CAP_RUN_TOKEN\", \"\")[::-1], end=\"\")'], "
                     "capture_output=True, text=True).stdout + ']')",
                     task_id="turn"))
         finally:
@@ -257,10 +275,11 @@ def test_session_kernel_never_serves_a_cell_with_another_credential():
         run_b = _cell("conv", "tok-b")
     for result in (run_a, run_a_again, chat, run_b):
         assert result["status"] == "success", result
-    assert "[tok-a]" in run_a["output"]
-    assert "[tok-a]" in run_a_again["output"] and run_a_again["kernel"]["reused"] is True
+    # printed reversed: the raw value is masked in tool output
+    assert "[a-kot]" in run_a["output"]
+    assert "[a-kot]" in run_a_again["output"] and run_a_again["kernel"]["reused"] is True
     assert "[]" in chat["output"] and chat["kernel"]["reused"] is False
-    assert "[tok-b]" in run_b["output"] and run_b["kernel"]["reused"] is False
+    assert "[b-kot]" in run_b["output"] and run_b["kernel"]["reused"] is False
 
 
 def test_kernel_key_holds_a_fingerprint_never_the_token():
@@ -298,14 +317,140 @@ def test_background_review_thread_runs_without_the_runs_token():
     assert parent_after_spawn == "tok-a"  # the run itself keeps its credential
 
 
-def test_run_end_ends_the_runs_kernels_and_its_childrens_only():
+def test_run_end_ends_only_the_kernels_holding_the_runs_credential():
     from tools.code_kernel import _KERNELS, shutdown_kernels_for_run
 
     with _kernel():
         _cell("run_1", "tok-a")
         _cell("run_1::child::c1", "tok-a")
-        _cell("run_10", "tok-b")  # a prefix-alike owner of another run survives
-        _cell("conv")
-        shutdown_kernels_for_run("run_1")
+        _cell("run_1::child::bg")  # a background child dropped the credential: keeps working
+        _cell("run_10", "tok-b")  # a prefix-alike owner of another run survives (4 = the LRU cap)
+        shutdown_kernels_for_run("run_1", "")  # no credential: nothing to end
+        assert len(_KERNELS) == 4
+        shutdown_kernels_for_run("run_1", "tok-a")
         owners = sorted(k[0] for k in _KERNELS)
-    assert owners == ["conv", "run_10"]
+    assert owners == ["run_10", "run_1::child::bg"]
+
+
+# --- revocation: copied contexts hold a grant key, never the token -------------------------------
+
+def test_a_worker_abandoned_by_the_run_cannot_spawn_with_its_token_after_it_ends():
+    # run_bounded_sync / tool-executor timeouts leave a worker on a COPIED context; clearing the
+    # run's own context must still revoke what that copy can reach.
+    def body():
+        tokens = set_session_vars(platform="api_server", cap_run_token="tok-late")
+        abandoned = contextvars.copy_context()
+        assert abandoned.run(cap_run_token) == "tok-late"
+        clear_session_vars(tokens)
+        return abandoned.run(cap_run_token), abandoned.run(apply_cap_run_token, {})
+
+    assert _fresh(body) == ("", {})
+
+
+def test_a_late_kernel_spawned_after_the_run_ends_gets_no_token():
+    from tools.approval_context import reset_current_session_key, set_current_session_key
+    from tools.code_execution_tool import execute_code
+
+    def body():
+        tokens = set_session_vars(platform="", cap_run_token="tok-late")
+        abandoned = contextvars.copy_context()
+        clear_session_vars(tokens)
+
+        def late_cell():
+            key = set_current_session_key("run_late")
+            try:
+                return json.loads(execute_code(
+                    "import os\nprint('[' + os.environ.get('CAP_RUN_TOKEN', '') + ']')", task_id="t"))
+            finally:
+                reset_current_session_key(key)
+
+        return abandoned.run(late_cell)
+
+    with _kernel():
+        result = _fresh(body)
+    assert result["status"] == "success", result
+    assert "[]" in result["output"]
+
+
+# --- the snapshot fails closed -------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+@pytest.mark.parametrize("command", [
+    f"readonly {CAP_RUN_TOKEN_ENV}",                      # survives unset: export -p writes -rx
+    f'export COPY_OF_IT="${CAP_RUN_TOKEN_ENV}"',          # the value under another name
+])
+def test_snapshot_never_publishes_the_token_even_when_unset_cannot_remove_it(tmp_path, command):
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    env.init_session()
+
+    def run(cmd, **bind):
+        out = {}
+
+        def worker():
+            with _bound(**bind):
+                out["r"] = env.execute(cmd)
+
+        t = threading.Thread(target=contextvars.Context().run, args=(worker,))
+        t.start()
+        t.join(30)
+        return out["r"].get("output", "")
+
+    try:
+        run("export KEEP_ME=1")  # a normal export is still persisted
+        run(command, cap_run_token="tok-ro")
+        later = run(f'echo "[${CAP_RUN_TOKEN_ENV}|${{COPY_OF_IT:-}}|$KEEP_ME]"', session_id="chat")
+        assert "[||1]" in later, later
+        with open(env._snapshot_path) as f:
+            snap = f.read()
+        assert "tok-ro" not in snap and f"{CAP_RUN_TOKEN_ENV}=" not in snap
+    finally:
+        env.cleanup()
+
+
+# --- value-based redaction -----------------------------------------------------------------------
+
+def test_the_run_token_is_masked_in_output_logs_and_after_revocation():
+    from agent.redact import redact_sensitive_text, redact_terminal_output
+
+    secret = "opaque-run-credential-7f3a"
+
+    def body():
+        tokens = set_session_vars(platform="api_server", cap_run_token=secret)
+        try:
+            in_run = (redact_terminal_output(f"{secret}\n", "printenv CAP_RUN_TOKEN"),
+                      redact_sensitive_text(f"curl -H 'X-Cap-Run-Token: {secret}' x"),
+                      redact_sensitive_text(f"x-cap-run-token=other-value-123"))
+        finally:
+            clear_session_vars(tokens)
+        return in_run, redact_sensitive_text(f"late {secret}")
+
+    (printed, header, other_header), late = _fresh(body)
+    for text in (printed, header, other_header, late):
+        assert secret not in text and "other-value-123" not in text, text
+    assert "[REDACTED:cap-run-token]" in printed and "[REDACTED:cap-run-token]" in late
+
+
+def test_redaction_masks_the_token_even_with_redaction_disabled():
+    import agent.redact as redact
+
+    def body():
+        with _bound(cap_run_token="opaque-run-credential-9b1c"), \
+                patch.object(redact, "_REDACT_ENABLED", False):
+            return redact.redact_sensitive_text("v=opaque-run-credential-9b1c")
+
+    assert "opaque-run-credential-9b1c" not in _fresh(body)
+
+
+def test_terminal_tool_result_never_shows_the_token(tmp_path):
+    from tools.terminal_tool import terminal_tool
+
+    def body():
+        with _bound(platform="", session_id="run-x", cap_run_token="opaque-run-credential-c0de"):
+            return json.loads(terminal_tool(command=f"printenv {CAP_RUN_TOKEN_ENV}", task_id="t-redact"))
+
+    with patch.dict(os.environ, {"TERMINAL_ENV": "local", "TERMINAL_CWD": str(tmp_path)}):
+        result = _fresh(body)
+    assert "opaque-run-credential-c0de" not in json.dumps(result)
+    assert "[REDACTED:cap-run-token]" in result.get("output", ""), result

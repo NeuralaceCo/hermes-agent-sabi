@@ -6,6 +6,9 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 """
 
 import os
+import secrets
+import threading
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
@@ -58,11 +61,49 @@ _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", defa
 _CRON_AUTO_DELIVER_THREAD_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
 # Cap (A126 §4): one routine run's per-run credential, bound per /v1/runs run (body.cap_run_token)
-# and handed ONLY to the spawn surfaces that can run cap-cli (terminal foreground/background,
-# execute_code). Deliberately NOT in _VAR_MAP: it is a credential, so it must not ride every child
-# env, get_session_env's os.environ fallback, or a long-lived daemon. Never logged, never persisted.
+# and handed ONLY to the in-run spawn surfaces that can run cap-cli: foreground terminal commands
+# and execute_code (never background processes, which outlive the run). Deliberately NOT in
+# _VAR_MAP: it is a credential, so it must not ride every child env, get_session_env's os.environ
+# fallback, or a long-lived daemon. Never logged, never persisted.
+# The ContextVar holds only an opaque grant key; the token lives in a process registry that the
+# bind's clear revokes. Copied contexts (a worker abandoned on timeout, a child thread) keep the
+# key, never the token, so after the run ends nothing can spawn with it.
 CAP_RUN_TOKEN_ENV = "CAP_RUN_TOKEN"
-_CAP_RUN_TOKEN = ContextVar(CAP_RUN_TOKEN_ENV, default=_UNSET)
+_CAP_RUN_TOKEN = ContextVar("HERMES_CAP_RUN_GRANT", default=_UNSET)
+_RUN_GRANTS: dict = {}
+_RUN_GRANTS_LOCK = threading.Lock()
+# Revoked values stay maskable for late output (agent.redact); bounded, values only.
+_REVOKED_RUN_TOKENS: deque = deque(maxlen=64)
+
+
+class _RunTokenGrant:
+    """Marker in set_session_vars' token list: clear_session_vars revokes exactly this grant."""
+    __slots__ = ("key",)
+
+    def __init__(self, key: str):
+        self.key = key
+
+
+def _grant_run_token(token: Any) -> "_RunTokenGrant | None":
+    if not isinstance(token, str) or not token:
+        return None
+    grant = _RunTokenGrant(secrets.token_hex(16))
+    with _RUN_GRANTS_LOCK:
+        _RUN_GRANTS[grant.key] = token
+    return grant
+
+
+def _revoke_run_grants(tokens: list) -> None:
+    with _RUN_GRANTS_LOCK:
+        for grant in tokens:
+            if isinstance(grant, _RunTokenGrant) and (value := _RUN_GRANTS.pop(grant.key, None)):
+                _REVOKED_RUN_TOKENS.append(value)
+
+
+def known_cap_run_tokens() -> list:
+    """Every live or recently revoked run credential (for value-based redaction only)."""
+    with _RUN_GRANTS_LOCK:
+        return [*_RUN_GRANTS.values(), *_REVOKED_RUN_TOKENS]
 
 # Legacy env-var name -> ContextVar for get_session_env (_SESSION_ASYNC_DELIVERY deliberately
 # absent: it is a bool capability, read via async_delivery_supported).
@@ -137,7 +178,10 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     # Every bind sets it (default ""), so a chat turn or cron reusing a thread never sees a run's token.
-    tokens.append(_CAP_RUN_TOKEN.set(cap_run_token if isinstance(cap_run_token, str) else ""))
+    grant = _grant_run_token(cap_run_token)
+    tokens.append(_CAP_RUN_TOKEN.set(grant.key if grant else ""))
+    if grant:
+        tokens.append(grant)
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -148,6 +192,7 @@ def clear_session_vars(tokens: list) -> None:
     goes back to ``_UNSET``: a cleared context is default-supported, not opted-out."""
     for var in _SESSION_VARS:
         var.set("")
+    _revoke_run_grants(tokens or [])
     _CAP_RUN_TOKEN.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
@@ -167,8 +212,11 @@ def reset_session_vars() -> None:
 
 def cap_run_token() -> str:
     """The current run's Cap run credential, or "" outside a routine run."""
-    value = _CAP_RUN_TOKEN.get()
-    return value if isinstance(value, str) else ""
+    key = _CAP_RUN_TOKEN.get()
+    if not isinstance(key, str) or not key:
+        return ""
+    with _RUN_GRANTS_LOCK:
+        return _RUN_GRANTS.get(key, "")
 
 
 def drop_cap_run_token() -> None:

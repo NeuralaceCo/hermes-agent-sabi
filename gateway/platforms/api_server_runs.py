@@ -635,7 +635,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                     # The run's execute_code kernels hold its credential in their env: end them with it.
                     from tools.code_kernel import shutdown_kernels_for_run
                     with suppress(Exception):
-                        shutdown_kernels_for_run(run.approval_session_key)
+                        shutdown_kernels_for_run(run.approval_session_key, run.cap_run_token)
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 
