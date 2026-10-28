@@ -1,11 +1,13 @@
 """Local execution environment — spawn-per-call with session snapshot."""
 
 import contextlib
+import contextvars
 import logging
 import ntpath
 import os
 import platform
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -685,34 +687,29 @@ def _kill_process_windows(proc) -> None:
         proc.wait(timeout=2.0)
 
 
-def _read_text_or_none(path: str) -> "str | None":
+# Cap (A126 §4): during a routine run, bash moves the finished snapshot dump to this staging path
+# (in the ``.tmp.*`` namespace cleanup() sweeps), never onto the shared snapshot itself.
+_SNAPSHOT_STAGE = contextvars.ContextVar("hermes_local_snapshot_stage", default="")
+
+
+def _publish_staged_snapshot(stage: str, path: str, token: str) -> None:
+    """Move the staged dump onto the shared snapshot only if it does not hold *token* (the run's
+    registry value, not the shell's mutable $CAP_RUN_TOKEN); otherwise discard it, so no reader
+    sharing the env ever sees it and the previous snapshot stays."""
     try:
-        with open(path, encoding="utf-8", errors="surrogateescape") as f:
-            return f.read()
+        with open(stage, encoding="utf-8", errors="surrogateescape") as f:
+            text = f.read()
     except OSError:
-        return None
-
-
-def _restore_snapshot_without(path: str, token: str, before: "str | None") -> None:
-    """If the snapshot at *path* now holds *token*, put back *before* (atomically) or remove it.
-    ponytail: a concurrent session's snapshot update in the same window is lost too; it re-dumps
-    on its next command."""
-    after = _read_text_or_none(path)
-    if after is None or token not in after:
-        return
-    logger.warning("terminal snapshot held a routine run credential; restored the previous snapshot")
+        return  # bash never staged a dump (failed, or unchanged)
     try:
-        if before is None or token in before:
-            os.unlink(path)
-            return
-        tmp = f"{path}.restore-{os.getpid()}-{threading.get_ident()}"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
-            f.write(before)
-        os.replace(tmp, path)
+        if token in text:
+            logger.warning("terminal snapshot held a routine run credential; kept the previous snapshot")
+            os.unlink(stage)
+        else:
+            os.replace(stage, path)
     except OSError:
         with contextlib.suppress(OSError):
-            os.unlink(path)
+            os.unlink(stage)
 
 
 class LocalEnvironment(BaseEnvironment):
@@ -803,19 +800,39 @@ class LocalEnvironment(BaseEnvironment):
                 self.cwd, safe_cwd)
         self.cwd = safe_cwd
 
-    def execute(self, command: str, *args, **kwargs) -> dict:
-        """Cap (A126 §4): during a routine run, the shared snapshot is checked host-side after the
-        command against the run's own credential (from the grant registry, not the shell's
-        mutable $CAP_RUN_TOKEN). A snapshot holding it, under any name, is put back as it was."""
+    @contextlib.contextmanager
+    def _run_token_snapshot_stage(self):
+        """Cap (A126 §4): while a routine run's credential is bound, snapshot dumps are staged
+        and validated host-side before they replace the shared snapshot."""
         from gateway.session_context import cap_run_token
         token = cap_run_token()
         if not token:
-            return super().execute(command, *args, **kwargs)
-        before = _read_text_or_none(self._snapshot_path)
+            yield False
+            return
+        stage = f"{self._snapshot_path}.tmp.run-{secrets.token_hex(8)}"
+        reset = _SNAPSHOT_STAGE.set(stage)
         try:
-            return super().execute(command, *args, **kwargs)
+            yield True
         finally:
-            _restore_snapshot_without(self._snapshot_path, token, before)
+            _SNAPSHOT_STAGE.reset(reset)
+            _publish_staged_snapshot(stage, self._snapshot_path, token)
+
+    def _snapshot_script_kwargs(self, cwd: str) -> dict:
+        kwargs = super()._snapshot_script_kwargs(cwd)
+        stage = _SNAPSHOT_STAGE.get()
+        if stage.startswith(f"{self._snapshot_path}.tmp.run-"):
+            kwargs["quoted_publish"] = self._quote_shell_path(stage)
+        return kwargs
+
+    def init_session(self):
+        with self._run_token_snapshot_stage() as staged:
+            super().init_session()
+        if staged and self._snapshot_ready and not os.path.exists(self._snapshot_path):
+            self._snapshot_ready = False  # the bootstrap dump was rejected: bash -l per command
+
+    def execute(self, command: str, *args, **kwargs) -> dict:
+        with self._run_token_snapshot_stage():
+            return super().execute(command, *args, **kwargs)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:

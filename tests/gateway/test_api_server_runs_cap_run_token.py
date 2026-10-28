@@ -88,6 +88,12 @@ def test_body_token_validation():
     assert _cap_run_token({"cap_run_token": " tok "}) == "tok"
     assert _cap_run_token({"cap_run_token": "x" * 4097}) == ""
     assert _cap_run_token({"cap_run_token": "a\nb"}) == ""
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.Ab-_c9"
+    assert _cap_run_token({"cap_run_token": jwt}) == jwt
+    assert _cap_run_token({"cap_run_token": "x" * 4096}) == "x" * 4096
+    # Anything export -p would escape (so a literal snapshot match could miss it) is dropped.
+    for unsafe in ("a b", "tok$x", 'a"b', "a'b", "a\\b", "a`b", "tök", "a\tb"):
+        assert _cap_run_token({"cap_run_token": unsafe}) == "", unsafe
     assert _cap_run_token({"cap_run_token": 5}) == ""
     assert _cap_run_token({}) == ""
     assert _cap_run_token(None) == ""

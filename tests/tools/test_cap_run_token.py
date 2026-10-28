@@ -514,3 +514,95 @@ def test_terminal_spill_masks_the_token_even_split_across_chunks(tmp_path):
     assert secret not in text
     assert text.count("[REDACTED:cap-run-token]") == 2
     assert text.startswith("a" * 60) and "b" * 10 in text
+
+
+def test_a_spill_cap_inside_a_token_never_writes_any_of_it(tmp_path):
+    from tools.environments.base_output import _BoundedOutputCollector
+
+    secret = "opaque-run-credential-cap9"
+
+    def body():
+        with _bound(cap_run_token=secret):
+            collector = _BoundedOutputCollector(max_chars=50, spill_path=tmp_path / "spill.txt")
+        with patch.object(_BoundedOutputCollector, "_SPILL_CAP_CHARS", 100):
+            collector.append("a" * 90 + secret[:10])  # exactly fills the cap, token still open
+            collector.append(secret[10:] + "b" * 50)
+        return collector.close_spill()
+
+    with open(_fresh(body)) as f:
+        text = f.read()
+    assert "opaque" not in text and "[spill capped" in text, text
+
+
+# --- the snapshot is checked before anyone can source it ----------------------------------------
+
+def _run_in(env, cmd, **bind):
+    out = {}
+
+    def worker():
+        with _bound(**bind):
+            out["r"] = env.execute(cmd)
+
+    t = threading.Thread(target=contextvars.Context().run, args=(worker,))
+    t.start()
+    t.join(30)
+    return out["r"].get("output", "")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_a_runs_snapshot_dump_is_staged_and_never_reaches_the_shared_path_unchecked(tmp_path):
+    from tools.environments import local as local_env
+
+    env = local_env.LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    real, seen = local_env._publish_staged_snapshot, []
+
+    def spy(stage, path, token):
+        with open(path) as f:
+            live = f.read()
+        with open(stage) as f:
+            staged = f.read()
+        seen.append((token in live, token in staged))
+        real(stage, path, token)
+        assert not os.path.exists(stage)
+
+    try:
+        with patch.object(local_env, "_publish_staged_snapshot", spy):
+            # Hidden from the in-shell check (the shell var is gone), caught on the host.
+            _run_in(env, f'export COPY_OF_IT="${CAP_RUN_TOKEN_ENV}"; unset {CAP_RUN_TOKEN_ENV}',
+                    cap_run_token="tok-stage")
+            _run_in(env, "export KEEP_ME=1", cap_run_token="tok-stage")
+        assert seen == [(False, True), (False, False)], seen
+        later = _run_in(env, 'echo "[${COPY_OF_IT:-}|${KEEP_ME:-}]"', session_id="chat")
+        assert "[|1]" in later, later
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+@pytest.mark.parametrize("profile,published", [
+    (f'export COPY_OF_IT="${CAP_RUN_TOKEN_ENV}"; unset {CAP_RUN_TOKEN_ENV}', False),
+    ("export BOOT_OK=1", True),
+])
+def test_a_bootstrap_inside_a_run_is_checked_before_it_becomes_the_snapshot(tmp_path, profile, published):
+    import glob
+
+    from tools.environments.local import LocalEnvironment
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".bash_profile").write_text(profile + "\n")
+
+    def build():
+        with _bound(cap_run_token="tok-boot"):
+            return LocalEnvironment(cwd=str(tmp_path), timeout=30, env={"HOME": str(home)})
+
+    env = _fresh(build)
+    try:
+        assert env._snapshot_ready is published
+        assert os.path.exists(env._snapshot_path) is published
+        assert not glob.glob(f"{env._snapshot_path}.tmp.*")
+        if published:
+            with open(env._snapshot_path) as f:
+                assert "BOOT_OK" in f.read()
+    finally:
+        env.cleanup()

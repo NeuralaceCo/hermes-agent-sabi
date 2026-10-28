@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import suppress
@@ -439,14 +440,19 @@ class _RunLaunch:
             self.queue.put_nowait(event)
 
 
+# cap-ts sends an HS256 JWT. A shell-inert alphabet keeps the value byte-identical in an
+# ``export -p`` dump, so the host-side snapshot check can match it literally.
+_CAP_RUN_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,4096}")
+
+
 def _cap_run_token(body: Any) -> str:
-    """Cap (A126 §4): the optional per-run credential; anything but a bounded single-line string
-    is dropped (the run then has no credential, so its sends ask — the safe direction)."""
+    """Cap (A126 §4): the optional per-run credential; anything but a bounded string in the JWT
+    alphabet is dropped (the run then has no credential, so its sends ask — the safe direction)."""
     token = body.get("cap_run_token") if isinstance(body, dict) else None
-    if not isinstance(token, str) or len(token) > 4096:
+    if not isinstance(token, str):
         return ""
     token = token.strip()
-    return token if token.isprintable() else ""
+    return token if _CAP_RUN_TOKEN_RE.fullmatch(token) else ""
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
