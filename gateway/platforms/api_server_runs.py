@@ -493,7 +493,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
         idempotency_fingerprint = hashlib.sha256(json.dumps(
-            {"body": body, "gateway_session_key": gateway_session_key or ""},
+            # cap_run_token is a fresh credential per claim, not part of what the request asks for.
+            {"body": {k: v for k, v in body.items() if k != "cap_run_token"},
+             "gateway_session_key": gateway_session_key or ""},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode()).hexdigest()
     raw_input = body.get("input")
@@ -629,6 +631,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
+                if run.cap_run_token:
+                    # The run's execute_code kernels hold its credential in their env: end them with it.
+                    from tools.code_kernel import shutdown_kernels_for_run
+                    with suppress(Exception):
+                        shutdown_kernels_for_run(run.approval_session_key)
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 

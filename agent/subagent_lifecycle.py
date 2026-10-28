@@ -358,6 +358,9 @@ class SubagentLifecycleService:
                 _REGISTRY.correlations.pop((handle.parent_session_id, handle.correlation_id), None)
 
     def _run(self, record: _Record, goal: str, parent: Any) -> None:
+        # Outlives the caller's turn on a copied context: never holds a Cap run credential.
+        from gateway.session_context import drop_cap_run_token
+        drop_cap_run_token()
         with _REGISTRY.lock:
             if record.state is not SubagentState.CANCEL_REQUESTED:
                 record.state = SubagentState.RUNNING

@@ -104,8 +104,8 @@ def test_token_is_not_a_bridged_session_var():
         with _bound(cap_run_token="tok-a"):
             return get_session_env(CAP_RUN_TOKEN_ENV, "")
 
-    with patch.dict(os.environ, {CAP_RUN_TOKEN_ENV: ""}):
-        assert _fresh(body) == ""
+    with patch.dict(os.environ, {CAP_RUN_TOKEN_ENV: "ambient"}):
+        assert _fresh(body) == "ambient"  # get_session_env never sees the bound token
 
 
 def test_concurrent_runs_each_see_only_their_own_token():
@@ -189,10 +189,10 @@ def test_foreground_terminal_sees_the_token_in_run_only_and_snapshot_never_keeps
         assert "[tok-a]" in in_run, in_run
         assert "[]" in chat_turn and "tok-a" not in chat_turn and "ambient" not in chat_turn, chat_turn
         assert "[tok-b]" in other_run and "tok-a" not in other_run, other_run
-        if os.path.exists(env._snapshot_path):
-            with open(env._snapshot_path) as f:
-                snap = f.read()
-            assert CAP_RUN_TOKEN_ENV not in snap and "tok-a" not in snap and "tok-b" not in snap
+        assert os.path.exists(env._snapshot_path)  # the snapshot path is really exercised
+        with open(env._snapshot_path) as f:
+            snap = f.read()
+        assert CAP_RUN_TOKEN_ENV not in snap and "tok-a" not in snap and "tok-b" not in snap
     finally:
         env.cleanup()
 
@@ -296,3 +296,16 @@ def test_background_review_thread_runs_without_the_runs_token():
         parent_after_spawn = _fresh(body)
     assert seen["token"] == ""
     assert parent_after_spawn == "tok-a"  # the run itself keeps its credential
+
+
+def test_run_end_ends_the_runs_kernels_and_its_childrens_only():
+    from tools.code_kernel import _KERNELS, shutdown_kernels_for_run
+
+    with _kernel():
+        _cell("run_1", "tok-a")
+        _cell("run_1::child::c1", "tok-a")
+        _cell("run_10", "tok-b")  # a prefix-alike owner of another run survives
+        _cell("conv")
+        shutdown_kernels_for_run("run_1")
+        owners = sorted(k[0] for k in _KERNELS)
+    assert owners == ["conv", "run_10"]

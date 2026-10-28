@@ -96,3 +96,36 @@ def test_body_token_validation():
 def test_launch_repr_never_shows_the_token():
     launch = _RunLaunch(*([None] * 12), cap_run_token="tok-secret")
     assert "tok-secret" not in repr(launch)
+
+
+@pytest.mark.asyncio
+async def test_run_end_shuts_its_kernels_only_when_it_had_a_token():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    ended = []
+    with patch.object(adapter, "_create_agent", side_effect=lambda **_: _agent(lambda *a: None)), \
+            patch("tools.code_kernel.shutdown_kernels_for_run", side_effect=ended.append):
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            with_token = await cli.post("/v1/runs", json={"input": "r", "cap_run_token": "tok"})
+            run_id = (await with_token.json())["run_id"]
+            await _finish(cli, run_id)
+            await _finish(cli, (await (await cli.post("/v1/runs", json={"input": "c"})).json())["run_id"])
+    assert ended == [run_id]  # owner = the run's approval session key; a tokenless run is untouched
+
+
+@pytest.mark.asyncio
+async def test_idempotent_replay_ignores_a_fresh_token(tmp_path):
+    from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._run_idempotency_store.close()
+    adapter._run_idempotency_store = RunIdempotencyStore(str(tmp_path / "idem.db"))
+    with patch.object(adapter, "_create_agent", side_effect=lambda **_: _agent(lambda *a: None)):
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            headers = {"Idempotency-Key": "retry-1"}
+            first = await cli.post("/v1/runs", json={"input": "r", "cap_run_token": "tok-1"}, headers=headers)
+            second = await cli.post("/v1/runs", json={"input": "r", "cap_run_token": "tok-2"}, headers=headers)
+            assert first.status == second.status == 202
+            assert (await first.json())["run_id"] == (await second.json())["run_id"]
+            changed = await cli.post("/v1/runs", json={"input": "other", "cap_run_token": "tok-3"}, headers=headers)
+            assert changed.status == 409
+            await _finish(cli, (await first.json())["run_id"])

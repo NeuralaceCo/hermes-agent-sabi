@@ -440,6 +440,18 @@ def _run_token_scope() -> str:
     return hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""
 
 
+def shutdown_kernels_for_run(owner: str) -> None:
+    """Kill the kernels a /v1/runs run owns (its own and its delegated children's) when the run
+    ends, so none keeps the run's Cap credential in its env (A126 §4)."""
+    if not owner:
+        return
+    with _REGISTRY.lock:
+        doomed = [_KERNELS.pop(k) for k in list(_KERNELS)
+                  if k[0] == owner or str(k[0]).startswith(f"{owner}::child::")]
+    for kernel in doomed:
+        kernel.teardown()
+
+
 def shutdown_all_kernels() -> None:
     """Kill every session kernel. Registered via atexit; also used by tests."""
     _REGISTRY.shutdown()
