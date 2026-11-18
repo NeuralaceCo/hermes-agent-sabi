@@ -27,7 +27,9 @@ async def test_busy_injection_preserves_original_routing_fields(route, platform,
         platform=platform, chat_id="+15551230001", thread_id="thread", user_id="+15551230002",
         chat_type="group", scope_id="scope", profile="profile", parent_chat_id="parent",
         chat_id_alt="chat-alt", user_id_alt="user-alt", prospective_thread_id="future-thread",
-        message_id="source-message",
+        # The source's id is the slot Hermes binds for tools; an adapter may join tool-only data to it once the
+        # event's own run starts (cap-ts joins its turn key), and a runner that steers that event must not copy it.
+        message_id="message.tk1_" + "k" * 43,
     )
     original_source = asdict(source)
     event = MessageEvent(text="/steer request" if route == "explicit" else "request", source=source, message_id="message")
@@ -58,7 +60,7 @@ async def test_busy_injection_preserves_original_routing_fields(route, platform,
         "chat_id", "thread_id", "user_id", "chat_type", "scope_id", "profile",
         "parent_chat_id", "chat_id_alt", "user_id_alt", "prospective_thread_id",
     )}
-    expected.update(platform=platform.value, message_id=event.message_id, source_message_id=source.message_id)
+    expected.update(platform=platform.value, message_id=event.message_id)
     if redact_pii and platform != Platform.DISCORD:
         for key, value in expected.items():
             if key in ("platform", "chat_type"):
@@ -68,6 +70,7 @@ async def test_busy_injection_preserves_original_routing_fields(route, platform,
             expected[key] = hasher(value)
             assert origin[key] != value
     assert origin == expected
+    assert "tk1_" not in receiver.payload
     assert asdict(source) == original_source
     assert event.text == ("/steer request" if route == "explicit" else "request")
 
