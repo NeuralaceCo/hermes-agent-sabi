@@ -351,8 +351,8 @@ class GatewayBusySessionMixin:
                 "chat_id", "thread_id", "chat_type", "user_id", "scope_id", "profile",
                 "parent_chat_id", "chat_id_alt", "user_id_alt", "prospective_thread_id",
             )},
+            # sabi: never source.message_id, the tool slot: an adapter may join tool-only data to it at the run's start.
             "message_id": event.message_id,
-            "source_message_id": source.message_id,
         }
         origin = {key: value for key, value in origin.items() if value not in (None, "")}
         from gateway.run import _load_gateway_config
